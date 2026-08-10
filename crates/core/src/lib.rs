@@ -21,6 +21,44 @@ pub struct Message {
   pub parts: Vec<MessagePart>,
 }
 
+impl Thread {
+  pub fn apply_event(&mut self, event: AssistantEvent) {
+    match event {
+      AssistantEvent::MessageStarted { message } => self.messages.push(message),
+      AssistantEvent::TextDelta { message_id, delta } => {
+        if let Some(message) = self.message_mut(&message_id) {
+          message.push_text_delta(delta);
+        }
+      }
+      AssistantEvent::ThinkingDelta { message_id, delta } => {
+        if let Some(message) = self.message_mut(&message_id) {
+          message.push_thinking_delta(delta);
+        }
+      }
+      AssistantEvent::ToolCallStarted { message_id, call }
+      | AssistantEvent::ToolCallUpdated { message_id, call } => {
+        if let Some(message) = self.message_mut(&message_id) {
+          message.upsert_tool_call(call);
+        }
+      }
+      AssistantEvent::ToolCallFinished { message_id, result } => {
+        if let Some(message) = self.message_mut(&message_id) {
+          message.finish_tool_call(&result.call_id);
+          message.parts.push(MessagePart::ToolResult(result));
+        }
+      }
+      AssistantEvent::MessageFinished { .. } | AssistantEvent::Error { .. } => {}
+    }
+  }
+
+  fn message_mut(&mut self, message_id: &MessageId) -> Option<&mut Message> {
+    self
+      .messages
+      .iter_mut()
+      .find(|message| &message.id == message_id)
+  }
+}
+
 impl Message {
   pub fn user(id: impl Into<String>, text: impl Into<String>) -> Self {
     Self {
@@ -35,6 +73,47 @@ impl Message {
       id: MessageId(id.into()),
       role: Role::Assistant,
       parts: vec![MessagePart::Text { text: text.into() }],
+    }
+  }
+
+  fn push_text_delta(&mut self, delta: String) {
+    match self.parts.last_mut() {
+      Some(MessagePart::Text { text }) => text.push_str(&delta),
+      _ => self.parts.push(MessagePart::Text { text: delta }),
+    }
+  }
+
+  fn push_thinking_delta(&mut self, delta: String) {
+    match self.parts.last_mut() {
+      Some(MessagePart::Thinking { text, .. }) => text.push_str(&delta),
+      _ => self.parts.push(MessagePart::Thinking {
+        text: delta,
+        signature: None,
+      }),
+    }
+  }
+
+  fn upsert_tool_call(&mut self, call: ToolCall) {
+    if let Some(part) = self.parts.iter_mut().find(|part| match part {
+      MessagePart::ToolCall(existing) => existing.id == call.id,
+      _ => false,
+    }) {
+      *part = MessagePart::ToolCall(call);
+    } else {
+      self.parts.push(MessagePart::ToolCall(call));
+    }
+  }
+
+  fn finish_tool_call(&mut self, call_id: &ToolCallId) {
+    for part in &mut self.parts {
+      let MessagePart::ToolCall(call) = part else {
+        continue;
+      };
+
+      if &call.id == call_id {
+        call.status = ToolCallStatus::Finished;
+        break;
+      }
     }
   }
 }
@@ -163,3 +242,6 @@ pub trait AssistantRuntime: Send + Sync + 'static {
   fn send(&self, input: UserInput) -> AssistantEventStream<'_>;
   fn cancel(&self, thread_id: &ThreadId);
 }
+
+#[cfg(test)]
+mod tests;
