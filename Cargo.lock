@@ -2038,6 +2038,8 @@ name = "gpui-assistant-core"
 version = "0.0.1"
 dependencies = [
  "futures-core",
+ "futures-executor",
+ "futures-util",
  "serde",
 ]
 

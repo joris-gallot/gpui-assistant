@@ -1,6 +1,7 @@
 use std::pin::Pin;
 
 use futures_core::Stream;
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 
 pub type AssistantEventStream<'a> = Pin<Box<dyn Stream<Item = AssistantEvent> + Send + 'a>>;
@@ -60,6 +61,14 @@ impl Thread {
 }
 
 impl Message {
+  pub fn new(id: impl Into<String>, role: Role) -> Self {
+    Self {
+      id: MessageId(id.into()),
+      role,
+      parts: Vec::new(),
+    }
+  }
+
   pub fn user(id: impl Into<String>, text: impl Into<String>) -> Self {
     Self {
       id: MessageId(id.into()),
@@ -204,6 +213,16 @@ pub struct UserInput {
   pub attachments: Vec<Attachment>,
 }
 
+impl UserInput {
+  pub fn text(thread_id: impl Into<String>, text: impl Into<String>) -> Self {
+    Self {
+      thread_id: ThreadId(thread_id.into()),
+      text: text.into(),
+      attachments: Vec::new(),
+    }
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantEvent {
@@ -241,6 +260,45 @@ pub enum AssistantEvent {
 pub trait AssistantRuntime: Send + Sync + 'static {
   fn send(&self, input: UserInput) -> AssistantEventStream<'_>;
   fn cancel(&self, thread_id: &ThreadId);
+}
+
+#[derive(Clone, Debug)]
+pub struct EchoRuntime {
+  response_prefix: String,
+}
+
+impl Default for EchoRuntime {
+  fn default() -> Self {
+    Self::new("Echo: ")
+  }
+}
+
+impl EchoRuntime {
+  pub fn new(response_prefix: impl Into<String>) -> Self {
+    Self {
+      response_prefix: response_prefix.into(),
+    }
+  }
+}
+
+impl AssistantRuntime for EchoRuntime {
+  fn send(&self, input: UserInput) -> AssistantEventStream<'_> {
+    let message_id = MessageId(format!("{}-assistant", input.thread_id.0));
+    let response = format!("{}{}", self.response_prefix, input.text);
+
+    Box::pin(stream::iter(vec![
+      AssistantEvent::MessageStarted {
+        message: Message::new(message_id.0.clone(), Role::Assistant),
+      },
+      AssistantEvent::TextDelta {
+        message_id: message_id.clone(),
+        delta: response,
+      },
+      AssistantEvent::MessageFinished { message_id },
+    ]))
+  }
+
+  fn cancel(&self, _thread_id: &ThreadId) {}
 }
 
 #[cfg(test)]

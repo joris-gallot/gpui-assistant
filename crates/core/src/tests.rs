@@ -1,11 +1,8 @@
 use super::*;
+use futures_util::StreamExt;
 
 fn assistant_message(id: &str) -> Message {
-  Message {
-    id: MessageId(id.into()),
-    role: Role::Assistant,
-    parts: Vec::new(),
-  }
+  Message::new(id, Role::Assistant)
 }
 
 #[test]
@@ -83,6 +80,15 @@ fn apply_event_keeps_text_and_thinking_as_separate_parts() {
 }
 
 #[test]
+fn user_input_text_builds_input_without_attachments() {
+  let input = UserInput::text("thread", "Hello");
+
+  assert_eq!(input.thread_id, ThreadId("thread".into()));
+  assert_eq!(input.text, "Hello");
+  assert!(input.attachments.is_empty());
+}
+
+#[test]
 fn apply_event_updates_tool_call_and_appends_result() {
   let mut thread = Thread {
     id: ThreadId("thread".into()),
@@ -131,6 +137,33 @@ fn apply_event_updates_tool_call_and_appends_result() {
         output: "ok".into(),
         is_error: false,
       }),
+    ]
+  );
+}
+
+#[test]
+fn echo_runtime_streams_response_events() {
+  let runtime = EchoRuntime::default();
+  let events = futures_executor::block_on(async {
+    runtime
+      .send(UserInput::text("thread", "Hello"))
+      .collect::<Vec<_>>()
+      .await
+  });
+
+  assert_eq!(
+    events,
+    vec![
+      AssistantEvent::MessageStarted {
+        message: Message::new("thread-assistant", Role::Assistant),
+      },
+      AssistantEvent::TextDelta {
+        message_id: MessageId("thread-assistant".into()),
+        delta: "Echo: Hello".into(),
+      },
+      AssistantEvent::MessageFinished {
+        message_id: MessageId("thread-assistant".into()),
+      },
     ]
   );
 }

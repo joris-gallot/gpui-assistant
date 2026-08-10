@@ -16,6 +16,7 @@ homepage = "https://github.com/joris-gallot/gpui-assistant"
 [workspace.dependencies]
 anyhow = "1"
 futures-core = "0.3"
+futures-executor = "0.3"
 futures-util = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }

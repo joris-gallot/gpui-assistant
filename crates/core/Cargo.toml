@@ -8,4 +8,6 @@ homepage.workspace = true
 
 [dependencies]
 futures-core.workspace = true
+futures-executor.workspace = true
+futures-util.workspace = true
 serde.workspace = true
