@@ -1,0 +1,11 @@
+[package]
+name = "basic-chat"
+version = "0.0.1"
+edition.workspace = true
+publish = false
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-assistant-core.workspace = true
+gpui-assistant-ui.workspace = true

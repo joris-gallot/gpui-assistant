@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/ui",
+    "crates/openai-compatible",
+    "examples/basic-chat",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joris-gallot/gpui-assistant"
+homepage = "https://github.com/joris-gallot/gpui-assistant"
+
+[workspace.dependencies]
+anyhow = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-assistant-core = { path = "crates/core" }
+gpui-assistant-ui = { path = "crates/ui" }
+gpui-assistant-openai-compatible = { path = "crates/openai-compatible" }
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,11 @@
+[package]
+name = "gpui-assistant-openai-compatible"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+gpui-assistant-core.workspace = true
