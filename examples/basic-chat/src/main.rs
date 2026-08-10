@@ -1,6 +1,6 @@
 use gpui::{
   App, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions, div, prelude::*,
-  px, size,
+  px, rgb, size,
 };
 use gpui_assistant_core::{Message, Thread, ThreadId};
 use gpui_assistant_ui::AssistantView;
@@ -15,6 +15,7 @@ impl Render for BasicChat {
     div()
       .size_full()
       .p_4()
+      .bg(rgb(0xffffff))
       .child(AssistantView::new(self.thread.clone()))
   }
 }

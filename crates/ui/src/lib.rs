@@ -1,4 +1,4 @@
-use gpui::{App, IntoElement, RenderOnce, Window, div, prelude::*};
+use gpui::{App, IntoElement, RenderOnce, Window, div, prelude::*, rgb};
 use gpui_assistant_core::{MessagePart, Role, Thread};
 
 #[derive(Clone, Debug, IntoElement)]
@@ -19,6 +19,8 @@ impl RenderOnce for AssistantView {
       .flex_col()
       .gap_3()
       .size_full()
+      .bg(rgb(0xffffff))
+      .text_color(rgb(0x111827))
       .child(ThreadView::new(self.thread))
   }
 }
@@ -85,7 +87,9 @@ impl RenderOnce for MessageView {
       .p_3()
       .rounded_md()
       .border_1()
-      .child(div().text_sm().child(label))
-      .child(div().child(body))
+      .border_color(rgb(0xe5e7eb))
+      .bg(rgb(0xf9fafb))
+      .child(div().text_sm().text_color(rgb(0x6b7280)).child(label))
+      .child(div().text_color(rgb(0x111827)).child(body))
   }
 }
