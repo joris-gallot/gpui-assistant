@@ -199,7 +199,7 @@ mod tests {
   use super::*;
 
   fn setup(cx: &mut TestAppContext) -> (Entity<AssistantView>, VisualTestContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
 
     let assistant = cx.update(|cx| {
       cx.new(|_| {
