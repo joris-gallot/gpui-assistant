@@ -69,6 +69,7 @@ impl RenderOnce for MessageView {
       .flex()
       .flex_col()
       .gap_1()
+      .w_full()
       .p_3()
       .rounded(colors.radius)
       .border_1()

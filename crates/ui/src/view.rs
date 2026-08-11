@@ -268,6 +268,8 @@ impl Render for AssistantView {
       .flex_col()
       .gap_2()
       .size_full()
+      // A single wide message would otherwise widen the column past the window.
+      .overflow_hidden()
       .bg(colors.background)
       .text_color(colors.foreground)
       .child(
@@ -286,7 +288,8 @@ impl Render for AssistantView {
           .streaming(is_streaming)
           .into_any_element()
         })
-        .flex_1(),
+        .flex_1()
+        .w_full(),
       )
       .children(self.permissions_bar(&colors, cx))
       .child(self.status_bar(&colors, cx))
