@@ -14,7 +14,7 @@ This project is headless-first: the core runtime and message model are independe
 ## Examples
 
 - `cargo run -p basic-chat`: echo runtime, no agent to install
-- `cargo run -p acp-chat -- "npx -y @agentclientprotocol/claude-agent-acp@latest"`: any ACP agent command, defaulting to the Claude adapter
+- `cargo run -p acp-chat -- codex`: an ACP agent, either the `claude` or `codex` shorthand, or any command string to spawn
 
 ## Status
 

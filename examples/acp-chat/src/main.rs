@@ -8,17 +8,22 @@ use gpui_component::Root;
 use gpui_component_assets::Assets;
 use gpui_platform::application;
 
-fn main() {
-  let agent = match env::args().nth(1) {
-    Some(command) => match AcpAgent::from_str(&command) {
-      Ok(agent) => agent,
-      Err(error) => {
-        eprintln!("Invalid agent command {command:?}: {error}");
+fn agent() -> Result<AcpAgent, String> {
+  match env::args().nth(1).as_deref() {
+    None | Some("claude") => Ok(AcpAgent::claude_agent()),
+    Some("codex") => Ok(AcpAgent::codex()),
+    Some(command) => AcpAgent::from_str(command).map_err(|error| format!("{command:?}: {error}")),
+  }
+}
 
-        return;
-      }
-    },
-    None => AcpAgent::claude_agent(),
+fn main() {
+  let agent = match agent() {
+    Ok(agent) => agent,
+    Err(error) => {
+      eprintln!("Invalid agent command {error}");
+
+      return;
+    }
   };
   let cwd = env::current_dir().expect("a readable working directory");
 
