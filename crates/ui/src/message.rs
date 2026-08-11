@@ -48,10 +48,10 @@ impl RenderOnce for MessageView {
       Role::Tool => "Tool",
     };
     let last = parts.len().saturating_sub(1);
-    let blocks = parts.into_iter().enumerate().map(|(index, part)| {
+    let blocks = parts.into_iter().enumerate().filter_map(|(index, part)| {
       let block_id = ElementId::from(SharedString::from(format!("{id}-{index}")));
 
-      match part {
+      Some(match part {
         MessagePart::Text { mut text } => {
           if is_streaming && index == last {
             text.push('▌');
@@ -73,13 +73,15 @@ impl RenderOnce for MessageView {
           .child("Redacted thinking")
           .into_any_element(),
         MessagePart::ToolCall(call) => tool_call(call, &colors),
+        // An agent reporting a tool call through a terminal it owns leaves no output here.
+        MessagePart::ToolResult(result) if result.output.trim().is_empty() => return None,
         MessagePart::ToolResult(result) => tool_result(result, &colors),
         MessagePart::Attachment(attachment) => div()
           .text_sm()
           .text_color(colors.muted_foreground)
           .child(format!("Attachment: {}", attachment.name))
           .into_any_element(),
-      }
+      })
     });
 
     div()
@@ -87,6 +89,7 @@ impl RenderOnce for MessageView {
       .flex_col()
       .gap_2()
       .w_full()
+      .overflow_hidden()
       .p_3()
       .rounded(colors.radius)
       .border_1()
@@ -114,8 +117,11 @@ fn tool_call(call: ToolCall, colors: &AssistantColors) -> AnyElement {
     .flex()
     .gap_2()
     .w_full()
+    .overflow_hidden()
     .child(div().text_color(color).child(marker))
-    .child(div().child(call.name))
+    // A flex child refuses to shrink below its content by default, and a long command
+    // would push the whole column past the window.
+    .child(div().min_w_0().child(call.name))
     .into_any_element()
 }
 

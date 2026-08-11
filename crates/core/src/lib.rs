@@ -72,7 +72,7 @@ impl Thread {
       }
       AssistantEvent::ToolCallFinished { message_id, result } => {
         if let Some(message) = self.message_mut(&message_id) {
-          message.finish_tool_call(&result.call_id);
+          message.finish_tool_call(&result.call_id, result.is_error);
           message.parts.push(MessagePart::ToolResult(result));
         }
       }
@@ -171,14 +171,18 @@ impl Message {
     }
   }
 
-  fn finish_tool_call(&mut self, call_id: &ToolCallId) {
+  fn finish_tool_call(&mut self, call_id: &ToolCallId, is_error: bool) {
     for part in &mut self.parts {
       let MessagePart::ToolCall(call) = part else {
         continue;
       };
 
       if &call.id == call_id {
-        call.status = ToolCallStatus::Finished;
+        call.status = if is_error {
+          ToolCallStatus::Failed
+        } else {
+          ToolCallStatus::Finished
+        };
         break;
       }
     }

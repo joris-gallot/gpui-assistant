@@ -239,6 +239,7 @@ fn content_output(content: &[acp::ToolCallContent]) -> String {
   content
     .iter()
     .map(tool_call_content_text)
+    .filter(|text| !text.is_empty())
     .collect::<Vec<_>>()
     .join("\n")
 }
@@ -249,6 +250,9 @@ fn tool_call_content_text(content: &acp::ToolCallContent) -> String {
     acp::ToolCallContent::Diff(diff) => {
       format!("{}\n{}", diff.path.display(), diff.new_text)
     }
+    // Terminal content is a reference to a terminal the client is expected to own, and
+    // reading its output means implementing the `terminal/*` methods.
+    acp::ToolCallContent::Terminal(_) => String::new(),
     _ => "[unsupported tool content]".into(),
   }
 }

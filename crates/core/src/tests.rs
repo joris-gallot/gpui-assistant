@@ -213,6 +213,35 @@ fn streaming_message_id_only_targets_trailing_assistant_message() {
   assert_eq!(thread.streaming_message_id(), None);
 }
 
+#[test]
+fn apply_event_marks_a_tool_call_failed_when_its_result_is_an_error() {
+  let mut thread = thread(vec![assistant_message("message-1")]);
+  let call_id = ToolCallId("call-1".into());
+
+  thread.apply_event(AssistantEvent::ToolCallStarted {
+    message_id: MessageId("message-1".into()),
+    call: ToolCall {
+      id: call_id.clone(),
+      name: "cargo test".into(),
+      input: String::new(),
+      status: ToolCallStatus::Running,
+    },
+  });
+  thread.apply_event(AssistantEvent::ToolCallFinished {
+    message_id: MessageId("message-1".into()),
+    result: ToolResult {
+      call_id: call_id.clone(),
+      output: "denied".into(),
+      is_error: true,
+    },
+  });
+
+  assert_eq!(
+    thread.tool_call(&call_id).map(|call| call.status),
+    Some(ToolCallStatus::Failed)
+  );
+}
+
 fn permission_request(id: &str, call_id: &str) -> PermissionRequest {
   PermissionRequest {
     id: PermissionRequestId(id.into()),
