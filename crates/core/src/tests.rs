@@ -1,16 +1,25 @@
 use super::*;
 use futures_util::StreamExt;
 
+fn thread(messages: Vec<Message>) -> Thread {
+  Thread {
+    id: ThreadId("thread".into()),
+    messages,
+    ..Default::default()
+  }
+}
+
 fn assistant_message(id: &str) -> Message {
   Message::new(id, Role::Assistant)
 }
 
+fn collect(stream: AssistantEventStream) -> Vec<AssistantEvent> {
+  futures_executor::block_on(stream.collect::<Vec<_>>())
+}
+
 #[test]
 fn apply_event_appends_started_message() {
-  let mut thread = Thread {
-    id: ThreadId("thread".into()),
-    messages: Vec::new(),
-  };
+  let mut thread = thread(Vec::new());
 
   thread.apply_event(AssistantEvent::MessageStarted {
     message: assistant_message("message-1"),
@@ -23,10 +32,7 @@ fn apply_event_appends_started_message() {
 
 #[test]
 fn apply_event_coalesces_adjacent_text_deltas() {
-  let mut thread = Thread {
-    id: ThreadId("thread".into()),
-    messages: vec![assistant_message("message-1")],
-  };
+  let mut thread = thread(vec![assistant_message("message-1")]);
 
   thread.apply_event(AssistantEvent::TextDelta {
     message_id: MessageId("message-1".into()),
@@ -47,10 +53,7 @@ fn apply_event_coalesces_adjacent_text_deltas() {
 
 #[test]
 fn apply_event_keeps_text_and_thinking_as_separate_parts() {
-  let mut thread = Thread {
-    id: ThreadId("thread".into()),
-    messages: vec![assistant_message("message-1")],
-  };
+  let mut thread = thread(vec![assistant_message("message-1")]);
 
   thread.apply_event(AssistantEvent::ThinkingDelta {
     message_id: MessageId("message-1".into()),
@@ -90,10 +93,7 @@ fn user_input_text_builds_input_without_attachments() {
 
 #[test]
 fn apply_event_updates_tool_call_and_appends_result() {
-  let mut thread = Thread {
-    id: ThreadId("thread".into()),
-    messages: vec![assistant_message("message-1")],
-  };
+  let mut thread = thread(vec![assistant_message("message-1")]);
 
   let call_id = ToolCallId("call-1".into());
   thread.apply_event(AssistantEvent::ToolCallStarted {
@@ -142,28 +142,116 @@ fn apply_event_updates_tool_call_and_appends_result() {
 }
 
 #[test]
+fn thread_starts_idle() {
+  let thread = thread(Vec::new());
+
+  assert_eq!(thread.status, ThreadStatus::Idle);
+  assert!(!thread.is_generating());
+}
+
+#[test]
+fn apply_event_marks_thread_generating_until_finished() {
+  let mut thread = thread(Vec::new());
+
+  thread.apply_event(AssistantEvent::MessageStarted {
+    message: assistant_message("message-1"),
+  });
+  assert_eq!(thread.status, ThreadStatus::Generating);
+
+  thread.apply_event(AssistantEvent::TextDelta {
+    message_id: MessageId("message-1".into()),
+    delta: "Hi".into(),
+  });
+  assert_eq!(thread.status, ThreadStatus::Generating);
+
+  thread.apply_event(AssistantEvent::MessageFinished {
+    message_id: MessageId("message-1".into()),
+  });
+  assert_eq!(thread.status, ThreadStatus::Idle);
+}
+
+#[test]
+fn apply_event_records_error_and_clears_it_on_next_turn() {
+  let mut thread = thread(Vec::new());
+
+  thread.apply_event(AssistantEvent::Error {
+    message: "boom".into(),
+  });
+  assert_eq!(
+    thread.status,
+    ThreadStatus::Error {
+      message: "boom".into()
+    }
+  );
+
+  thread.apply_event(AssistantEvent::MessageStarted {
+    message: assistant_message("message-1"),
+  });
+  assert_eq!(thread.status, ThreadStatus::Generating);
+}
+
+#[test]
+fn streaming_message_id_only_targets_trailing_assistant_message() {
+  let mut thread = thread(vec![Message::user("user-1", "Hello")]);
+
+  assert_eq!(thread.streaming_message_id(), None);
+
+  thread.status = ThreadStatus::Generating;
+  assert_eq!(thread.streaming_message_id(), None);
+
+  thread.apply_event(AssistantEvent::MessageStarted {
+    message: assistant_message("message-1"),
+  });
+  assert_eq!(
+    thread.streaming_message_id(),
+    Some(&MessageId("message-1".into()))
+  );
+
+  thread.apply_event(AssistantEvent::MessageFinished {
+    message_id: MessageId("message-1".into()),
+  });
+  assert_eq!(thread.streaming_message_id(), None);
+}
+
+#[test]
 fn echo_runtime_streams_response_events() {
   let runtime = EchoRuntime::default();
-  let events = futures_executor::block_on(async {
-    runtime
-      .send(UserInput::text("thread", "Hello"))
-      .collect::<Vec<_>>()
-      .await
-  });
+  let events = collect(runtime.send(UserInput::text("thread", "Hello")));
 
   assert_eq!(
     events,
     vec![
       AssistantEvent::MessageStarted {
-        message: Message::new("thread-assistant", Role::Assistant),
+        message: Message::new("thread-assistant-0", Role::Assistant),
       },
       AssistantEvent::TextDelta {
-        message_id: MessageId("thread-assistant".into()),
+        message_id: MessageId("thread-assistant-0".into()),
         delta: "Echo: Hello".into(),
       },
       AssistantEvent::MessageFinished {
-        message_id: MessageId("thread-assistant".into()),
+        message_id: MessageId("thread-assistant-0".into()),
       },
     ]
+  );
+}
+
+#[test]
+fn echo_runtime_mints_a_distinct_message_id_per_turn() {
+  let runtime = EchoRuntime::default();
+  let mut thread = thread(Vec::new());
+
+  for event in collect(runtime.send(UserInput::text("thread", "first"))) {
+    thread.apply_event(event);
+  }
+  for event in collect(runtime.send(UserInput::text("thread", "second"))) {
+    thread.apply_event(event);
+  }
+
+  assert_eq!(thread.messages.len(), 2);
+  assert_eq!(
+    thread.messages[1].parts,
+    vec![MessagePart::Text {
+      text: "Echo: second".into()
+    }]
   );
 }

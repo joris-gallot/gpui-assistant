@@ -23,7 +23,7 @@ impl OpenAiCompatibleRuntime {
 }
 
 impl AssistantRuntime for OpenAiCompatibleRuntime {
-  fn send(&self, _input: UserInput) -> AssistantEventStream<'_> {
+  fn send(&self, _input: UserInput) -> AssistantEventStream {
     Box::pin(futures_util::stream::empty())
   }
 
