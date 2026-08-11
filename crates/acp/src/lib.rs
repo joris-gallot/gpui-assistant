@@ -2,7 +2,7 @@ mod mapping;
 mod terminal;
 
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex,
@@ -106,6 +106,8 @@ struct Shared {
   permissions: Mutex<HashMap<PermissionRequestId, Parked>>,
   next_permission: AtomicU64,
   terminals: Terminals,
+  /// Commands the user allowed for the rest of a session, keyed by session.
+  approved: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 /// A request from the agent that is waiting on the user.
@@ -116,7 +118,9 @@ enum Parked {
   },
   Terminal {
     session: String,
-    allow: PermissionOptionId,
+    label: String,
+    allow_once: PermissionOptionId,
+    allow_session: PermissionOptionId,
     // Boxed to keep the variant from dwarfing the rest of the enum.
     request: Box<acp::CreateTerminalRequest>,
     responder: Responder<acp::CreateTerminalResponse>,
@@ -141,6 +145,7 @@ impl Shared {
       permissions: Mutex::default(),
       next_permission: AtomicU64::default(),
       terminals: Terminals::default(),
+      approved: Mutex::default(),
     }
   }
 
@@ -279,15 +284,25 @@ impl Shared {
     responder: Responder<acp::CreateTerminalResponse>,
   ) {
     let session = request.session_id.0.to_string();
-    let request_id = self.next_permission_id();
-    let allow = PermissionOptionId(format!("{}-allow", request_id.0));
     let label = terminal_label(&request);
+
+    if self.is_approved(&session, &label) {
+      self.spawn_terminal(&request, responder);
+
+      return;
+    }
+
+    let request_id = self.next_permission_id();
+    let allow_once = PermissionOptionId(format!("{}-once", request_id.0));
+    let allow_session = PermissionOptionId(format!("{}-session", request_id.0));
 
     self.permissions.lock().unwrap().insert(
       request_id.clone(),
       Parked::Terminal {
         session: session.clone(),
-        allow: allow.clone(),
+        label: label.clone(),
+        allow_once: allow_once.clone(),
+        allow_session: allow_session.clone(),
         request: Box::new(request),
         responder,
       },
@@ -302,9 +317,14 @@ impl Shared {
           call_id: None,
           options: vec![
             PermissionOption {
-              id: allow,
+              id: allow_once,
               name: "Run".into(),
               kind: PermissionOptionKind::AllowOnce,
+            },
+            PermissionOption {
+              id: allow_session,
+              name: "Allow for session".into(),
+              kind: PermissionOptionKind::AllowAlways,
             },
             PermissionOption {
               id: PermissionOptionId(format!("{}-reject", request_id.0)),
@@ -315,6 +335,37 @@ impl Shared {
         },
       }],
     );
+  }
+
+  fn spawn_terminal(
+    &self,
+    request: &acp::CreateTerminalRequest,
+    responder: Responder<acp::CreateTerminalResponse>,
+  ) {
+    let _ = match self.terminals.create(request, &self.cwd) {
+      Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
+      Err(error) => responder.respond_with_internal_error(error),
+    };
+  }
+
+  /// Matched on the whole command line: allowing `cargo test` must not allow anything else.
+  fn is_approved(&self, session: &str, label: &str) -> bool {
+    self
+      .approved
+      .lock()
+      .unwrap()
+      .get(session)
+      .is_some_and(|approved| approved.contains(label))
+  }
+
+  fn approve_for_session(&self, session: &str, label: String) {
+    self
+      .approved
+      .lock()
+      .unwrap()
+      .entry(session.to_string())
+      .or_default()
+      .insert(label);
   }
 
   fn next_permission_id(&self) -> PermissionRequestId {
@@ -348,15 +399,22 @@ impl Shared {
       }
       Parked::Terminal {
         session,
-        allow,
+        label,
+        allow_once,
+        allow_session,
         request,
         responder,
       } => {
-        if option.as_ref() == Some(&allow) {
-          let _ = match self.terminals.create(&request, &self.cwd) {
-            Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
-            Err(error) => responder.respond_with_internal_error(error),
-          };
+        let allowed = option.as_ref().is_some_and(|option| {
+          if option == &allow_session {
+            self.approve_for_session(&session, label);
+          }
+
+          option == &allow_once || option == &allow_session
+        });
+
+        if allowed {
+          self.spawn_terminal(&request, responder);
         } else {
           let _ = responder.respond_with_internal_error("The user rejected running this command");
         }
@@ -540,4 +598,23 @@ async fn prompt(
 
   shared.emit(&session, events);
   shared.unregister(&session);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_session_approval_only_covers_the_exact_command() {
+    let shared = Shared::new(PathBuf::from("."));
+
+    shared.approve_for_session("session", "cargo test --workspace".into());
+
+    assert!(shared.is_approved("session", "cargo test --workspace"));
+    // A prefix match would have let anything after `cargo test` through.
+    assert!(!shared.is_approved("session", "cargo test --workspace; rm -rf /"));
+    assert!(!shared.is_approved("session", "cargo test"));
+    // Another session never inherits an approval.
+    assert!(!shared.is_approved("other", "cargo test --workspace"));
+  }
 }
