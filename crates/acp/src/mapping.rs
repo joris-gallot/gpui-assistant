@@ -6,6 +6,8 @@ use gpui_assistant_core::{
   PermissionRequest, PermissionRequestId, Role, ToolCall, ToolCallId, ToolCallStatus, ToolResult,
 };
 
+use crate::terminal::Terminals;
+
 pub(crate) struct Turn {
   session: String,
   index: u64,
@@ -30,7 +32,11 @@ impl Turn {
     }
   }
 
-  pub(crate) fn apply(&mut self, update: acp::SessionUpdate) -> Vec<AssistantEvent> {
+  pub(crate) fn apply(
+    &mut self,
+    update: acp::SessionUpdate,
+    terminals: &Terminals,
+  ) -> Vec<AssistantEvent> {
     let mut events = Vec::new();
 
     match update {
@@ -52,7 +58,7 @@ impl Turn {
       }
       acp::SessionUpdate::ToolCall(call) => {
         let message_id = self.open(&mut events);
-        let output = content_output(&call.content);
+        let output = content_output(&call.content, terminals);
         let call = ToolCall {
           id: ToolCallId(call.tool_call_id.0.to_string()),
           name: call.title,
@@ -93,7 +99,7 @@ impl Turn {
           state.call.status = tool_call_status(status);
         }
         if let Some(content) = update.fields.content {
-          state.output = content_output(&content);
+          state.output = content_output(&content, terminals);
         }
 
         events.push(AssistantEvent::ToolCallUpdated {
@@ -235,25 +241,34 @@ fn block_label(content: &acp::ContentBlock) -> &'static str {
   }
 }
 
-fn content_output(content: &[acp::ToolCallContent]) -> String {
+fn content_output(content: &[acp::ToolCallContent], terminals: &Terminals) -> String {
   content
     .iter()
-    .map(tool_call_content_text)
+    .map(|content| tool_call_content_text(content, terminals))
     .filter(|text| !text.is_empty())
     .collect::<Vec<_>>()
     .join("\n")
 }
 
-fn tool_call_content_text(content: &acp::ToolCallContent) -> String {
+fn tool_call_content_text(content: &acp::ToolCallContent, terminals: &Terminals) -> String {
   match content {
     acp::ToolCallContent::Content(content) => content_text(&content.content),
     acp::ToolCallContent::Diff(diff) => {
       format!("{}\n{}", diff.path.display(), diff.new_text)
     }
-    // Terminal content is a reference to a terminal the client is expected to own, and
-    // reading its output means implementing the `terminal/*` methods.
-    acp::ToolCallContent::Terminal(_) => String::new(),
+    // The agent embeds a terminal by id; we are the one running it, so read our buffer.
+    acp::ToolCallContent::Terminal(terminal) => terminals
+      .text(terminal.terminal_id.0.as_ref())
+      .unwrap_or_default(),
     _ => "[unsupported tool content]".into(),
+  }
+}
+
+#[cfg(test)]
+impl Turn {
+  /// Most updates carry no terminal reference, so tests skip the registry.
+  fn apply_without_terminals(&mut self, update: acp::SessionUpdate) -> Vec<AssistantEvent> {
+    self.apply(update, &Terminals::default())
   }
 }
 

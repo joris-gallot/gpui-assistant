@@ -19,7 +19,8 @@ fn tool_call_update(id: &str, status: acp::ToolCallStatus) -> acp::ToolCallUpdat
 fn the_first_chunk_of_a_turn_opens_an_assistant_message() {
   let mut turn = Turn::new("session");
 
-  let events = turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("Hel")));
+  let events =
+    turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("Hel")));
 
   assert_eq!(
     events,
@@ -34,7 +35,8 @@ fn the_first_chunk_of_a_turn_opens_an_assistant_message() {
     ]
   );
 
-  let events = turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("lo")));
+  let events =
+    turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("lo")));
 
   assert_eq!(
     events,
@@ -49,7 +51,7 @@ fn the_first_chunk_of_a_turn_opens_an_assistant_message() {
 fn each_turn_opens_its_own_message() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("first")));
+  turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("first")));
   assert_eq!(
     turn.end(acp::StopReason::EndTurn),
     vec![AssistantEvent::MessageFinished {
@@ -57,7 +59,8 @@ fn each_turn_opens_its_own_message() {
     }]
   );
 
-  let events = turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("second")));
+  let events =
+    turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("second")));
 
   assert_eq!(
     events.first(),
@@ -71,7 +74,8 @@ fn each_turn_opens_its_own_message() {
 fn thought_chunks_map_to_thinking_deltas() {
   let mut turn = Turn::new("session");
 
-  let events = turn.apply(acp::SessionUpdate::AgentThoughtChunk(text_chunk("hmm")));
+  let events =
+    turn.apply_without_terminals(acp::SessionUpdate::AgentThoughtChunk(text_chunk("hmm")));
 
   assert_eq!(
     events.last(),
@@ -88,7 +92,7 @@ fn user_message_chunks_are_dropped() {
 
   assert!(
     turn
-      .apply(acp::SessionUpdate::UserMessageChunk(text_chunk("Hello")))
+      .apply_without_terminals(acp::SessionUpdate::UserMessageChunk(text_chunk("Hello")))
       .is_empty()
   );
 }
@@ -97,10 +101,10 @@ fn user_message_chunks_are_dropped() {
 fn a_partial_update_merges_onto_the_call_snapshot() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCall(acp_tool_call(
     "call-1", "read",
   )));
-  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
+  let events = turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
     "call-1",
     acp::ToolCallStatus::InProgress,
   )));
@@ -124,7 +128,7 @@ fn a_partial_update_merges_onto_the_call_snapshot() {
 fn a_completed_update_also_emits_the_tool_result() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCall(acp_tool_call(
     "call-1", "read",
   )));
 
@@ -137,7 +141,7 @@ fn a_completed_update_also_emits_the_tool_result() {
       ))]),
   );
 
-  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(update));
+  let events = turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(update));
 
   assert_eq!(
     events.last(),
@@ -156,10 +160,10 @@ fn a_completed_update_also_emits_the_tool_result() {
 fn content_reported_before_completion_survives_into_the_result() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCall(acp_tool_call(
     "call-1", "read",
   )));
-  turn.apply(acp::SessionUpdate::ToolCallUpdate(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(
     acp::ToolCallUpdate::new(
       acp::ToolCallId::new("call-1"),
       acp::ToolCallUpdateFields::new()
@@ -171,7 +175,7 @@ fn content_reported_before_completion_survives_into_the_result() {
   ));
 
   // The terminal update carries no content: ACP already reported it.
-  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
+  let events = turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
     "call-1",
     acp::ToolCallStatus::Completed,
   )));
@@ -193,10 +197,10 @@ fn content_reported_before_completion_survives_into_the_result() {
 fn a_diff_keeps_its_path_and_new_text() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCall(acp_tool_call(
     "call-1", "edit",
   )));
-  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(
+  let events = turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(
     acp::ToolCallUpdate::new(
       acp::ToolCallId::new("call-1"),
       acp::ToolCallUpdateFields::new()
@@ -215,14 +219,64 @@ fn a_diff_keeps_its_path_and_new_text() {
   ));
 }
 
+#[cfg(unix)]
+#[test]
+fn terminal_content_resolves_to_the_output_we_captured() {
+  use std::{path::PathBuf, thread, time::Duration, time::Instant};
+
+  let terminals = Terminals::default();
+  let mut request = acp::CreateTerminalRequest::new(acp::SessionId::new("session"), "sh");
+  request.args = vec!["-c".into(), "printf ran".into()];
+
+  let id = terminals
+    .create(&request, &PathBuf::from("."))
+    .expect("sh is available");
+  let started = Instant::now();
+
+  while terminals
+    .output(&id)
+    .and_then(|output| output.exit_status)
+    .is_none()
+  {
+    assert!(
+      started.elapsed() < Duration::from_secs(10),
+      "sh never exited"
+    );
+    thread::sleep(Duration::from_millis(10));
+  }
+
+  let mut turn = Turn::new("session");
+  turn.apply(
+    acp::SessionUpdate::ToolCall(acp_tool_call("call-1", "run")),
+    &terminals,
+  );
+
+  let events = turn.apply(
+    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+      acp::ToolCallId::new("call-1"),
+      acp::ToolCallUpdateFields::new()
+        .status(acp::ToolCallStatus::Completed)
+        .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(
+          acp::TerminalId::new(id),
+        ))]),
+    )),
+    &terminals,
+  );
+
+  assert!(matches!(
+    events.last(),
+    Some(AssistantEvent::ToolCallFinished { result, .. }) if result.output == "ran"
+  ));
+}
+
 #[test]
 fn a_failed_update_marks_the_result_as_an_error() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+  turn.apply_without_terminals(acp::SessionUpdate::ToolCall(acp_tool_call(
     "call-1", "read",
   )));
-  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
+  let events = turn.apply_without_terminals(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
     "call-1",
     acp::ToolCallStatus::Failed,
   )));
@@ -237,7 +291,7 @@ fn a_failed_update_marks_the_result_as_an_error() {
 fn cancelling_ends_the_turn_without_an_error() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("partial")));
+  turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("partial")));
 
   assert_eq!(
     turn.end(acp::StopReason::Cancelled),
@@ -251,7 +305,7 @@ fn cancelling_ends_the_turn_without_an_error() {
 fn a_refusal_ends_the_turn_with_an_error() {
   let mut turn = Turn::new("session");
 
-  turn.apply(acp::SessionUpdate::AgentMessageChunk(text_chunk("partial")));
+  turn.apply_without_terminals(acp::SessionUpdate::AgentMessageChunk(text_chunk("partial")));
 
   assert!(matches!(
     turn.end(acp::StopReason::Refusal).as_slice(),

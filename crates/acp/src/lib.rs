@@ -1,4 +1,5 @@
 mod mapping;
+mod terminal;
 
 use std::{
   collections::HashMap,
@@ -21,7 +22,10 @@ use gpui_assistant_core::{
   ThreadId, UserInput,
 };
 
-use crate::mapping::{Turn, permission_request};
+use crate::{
+  mapping::{Turn, permission_request},
+  terminal::Terminals,
+};
 
 pub use agent_client_protocol::{AcpAgent, AcpAgentConfig};
 
@@ -101,6 +105,7 @@ struct Shared {
   turns: Mutex<HashMap<String, Turn>>,
   permissions: Mutex<HashMap<PermissionRequestId, ParkedPermission>>,
   next_permission: AtomicU64,
+  terminals: Terminals,
 }
 
 struct ParkedPermission {
@@ -143,7 +148,9 @@ impl Shared {
 
   fn dispatch(&self, notification: acp::SessionNotification) {
     let session = notification.session_id.0.to_string();
-    let events = self.with_turn(&session, |turn| turn.apply(notification.update));
+    let events = self.with_turn(&session, |turn| {
+      turn.apply(notification.update, &self.terminals)
+    });
 
     self.emit(&session, events);
   }
@@ -229,6 +236,12 @@ async fn run(
   let notifications = shared.clone();
   let permissions = shared.clone();
   let prompts = shared.clone();
+  let creates = shared.clone();
+  let create_cwd = cwd.clone();
+  let outputs = shared.clone();
+  let waits = shared.clone();
+  let kills = shared.clone();
+  let releases = shared.clone();
 
   let result = Client
     .builder()
@@ -247,9 +260,58 @@ async fn run(
       },
       agent_client_protocol::on_receive_request!(),
     )
+    .on_receive_request(
+      async move |request: acp::CreateTerminalRequest, responder, _connection| match creates
+        .terminals
+        .create(&request, &create_cwd)
+      {
+        Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
+        Err(error) => responder.respond_with_internal_error(error),
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
+    .on_receive_request(
+      async move |request: acp::TerminalOutputRequest, responder, _connection| match outputs
+        .terminals
+        .output(request.terminal_id.0.as_ref())
+      {
+        Some(output) => responder.respond(output),
+        None => responder.respond_with_internal_error("unknown terminal"),
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
+    .on_receive_request(
+      async move |request: acp::WaitForTerminalExitRequest, responder, _connection| {
+        // Parked until the process exits: waiting here would stall the dispatch loop.
+        waits
+          .terminals
+          .wait(request.terminal_id.0.as_ref(), responder);
+
+        Ok(())
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
+    .on_receive_request(
+      async move |request: acp::KillTerminalRequest, responder, _connection| {
+        kills.terminals.kill(request.terminal_id.0.as_ref());
+        responder.respond(acp::KillTerminalResponse::new())
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
+    .on_receive_request(
+      async move |request: acp::ReleaseTerminalRequest, responder, _connection| {
+        releases.terminals.release(request.terminal_id.0.as_ref());
+        responder.respond(acp::ReleaseTerminalResponse::new())
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
     .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
       connection
-        .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+        .send_request(
+          acp::InitializeRequest::new(ProtocolVersion::V1)
+            // Running the agent's commands ourselves is what makes their output visible.
+            .client_capabilities(acp::ClientCapabilities::new().terminal(true)),
+        )
         .block_task()
         .await?;
 
