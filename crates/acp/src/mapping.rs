@@ -1,0 +1,241 @@
+use std::collections::HashMap;
+
+use agent_client_protocol::schema::v1 as acp;
+use gpui_assistant_core::{
+  AssistantEvent, Message, MessageId, PermissionOption, PermissionOptionId, PermissionOptionKind,
+  PermissionRequest, PermissionRequestId, Role, ToolCall, ToolCallId, ToolCallStatus, ToolResult,
+};
+
+pub(crate) struct Turn {
+  session: String,
+  index: u64,
+  message_id: Option<MessageId>,
+  calls: HashMap<ToolCallId, ToolCall>,
+}
+
+impl Turn {
+  pub(crate) fn new(session: impl Into<String>) -> Self {
+    Self {
+      session: session.into(),
+      index: 0,
+      message_id: None,
+      calls: HashMap::new(),
+    }
+  }
+
+  pub(crate) fn apply(&mut self, update: acp::SessionUpdate) -> Vec<AssistantEvent> {
+    let mut events = Vec::new();
+
+    match update {
+      acp::SessionUpdate::AgentMessageChunk(chunk) => {
+        let message_id = self.open(&mut events);
+
+        events.push(AssistantEvent::TextDelta {
+          message_id,
+          delta: content_text(&chunk.content),
+        });
+      }
+      acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+        let message_id = self.open(&mut events);
+
+        events.push(AssistantEvent::ThinkingDelta {
+          message_id,
+          delta: content_text(&chunk.content),
+        });
+      }
+      acp::SessionUpdate::ToolCall(call) => {
+        let message_id = self.open(&mut events);
+        let call = ToolCall {
+          id: ToolCallId(call.tool_call_id.0.to_string()),
+          name: call.title,
+          input: call
+            .raw_input
+            .map(|input| input.to_string())
+            .unwrap_or_default(),
+          status: tool_call_status(call.status),
+        };
+
+        self.calls.insert(call.id.clone(), call.clone());
+        events.push(AssistantEvent::ToolCallStarted { message_id, call });
+      }
+      acp::SessionUpdate::ToolCallUpdate(update) => {
+        let message_id = self.open(&mut events);
+        let call_id = ToolCallId(update.tool_call_id.0.to_string());
+        // ACP sends partial updates, so merge onto the snapshot we already hold.
+        let call = self.calls.entry(call_id.clone()).or_insert(ToolCall {
+          id: call_id.clone(),
+          name: String::new(),
+          input: String::new(),
+          status: ToolCallStatus::Pending,
+        });
+
+        if let Some(title) = update.fields.title {
+          call.name = title;
+        }
+        if let Some(status) = update.fields.status {
+          call.status = tool_call_status(status);
+        }
+
+        let output = update.fields.content.map(|content| {
+          content
+            .iter()
+            .map(tool_call_content_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+        });
+
+        match call.status {
+          ToolCallStatus::Finished | ToolCallStatus::Failed => {
+            let is_error = call.status == ToolCallStatus::Failed;
+
+            events.push(AssistantEvent::ToolCallUpdated {
+              message_id: message_id.clone(),
+              call: call.clone(),
+            });
+            events.push(AssistantEvent::ToolCallFinished {
+              message_id,
+              result: ToolResult {
+                call_id,
+                output: output.unwrap_or_default(),
+                is_error,
+              },
+            });
+          }
+          ToolCallStatus::Pending | ToolCallStatus::Running => {
+            events.push(AssistantEvent::ToolCallUpdated {
+              message_id,
+              call: call.clone(),
+            });
+          }
+        }
+      }
+      // Nothing to show yet for plans, modes, commands or config, and the enum is
+      // non_exhaustive so unknown updates land here too.
+      _ => {}
+    }
+
+    events
+  }
+
+  pub(crate) fn end(&mut self, stop_reason: acp::StopReason) -> Vec<AssistantEvent> {
+    let mut events = Vec::new();
+
+    if let Some(message) = stop_reason_error(stop_reason) {
+      events.push(AssistantEvent::Error { message });
+    } else if let Some(message_id) = self.message_id.clone() {
+      events.push(AssistantEvent::MessageFinished { message_id });
+    }
+
+    self.reset();
+
+    events
+  }
+
+  pub(crate) fn fail(&mut self, message: impl Into<String>) -> Vec<AssistantEvent> {
+    self.reset();
+
+    vec![AssistantEvent::Error {
+      message: message.into(),
+    }]
+  }
+
+  fn open(&mut self, events: &mut Vec<AssistantEvent>) -> MessageId {
+    if let Some(message_id) = &self.message_id {
+      return message_id.clone();
+    }
+
+    // ACP has no "message started" update, so the first chunk of a turn opens one.
+    let message_id = MessageId(format!("{}-assistant-{}", self.session, self.index));
+    events.push(AssistantEvent::MessageStarted {
+      message: Message::new(message_id.0.clone(), Role::Assistant),
+    });
+    self.message_id = Some(message_id.clone());
+
+    message_id
+  }
+
+  fn reset(&mut self) {
+    self.message_id = None;
+    self.calls.clear();
+    self.index += 1;
+  }
+}
+
+pub(crate) fn permission_request(
+  id: PermissionRequestId,
+  request: &acp::RequestPermissionRequest,
+) -> PermissionRequest {
+  PermissionRequest {
+    id,
+    call_id: ToolCallId(request.tool_call.tool_call_id.0.to_string()),
+    options: request
+      .options
+      .iter()
+      .map(|option| PermissionOption {
+        id: PermissionOptionId(option.option_id.0.to_string()),
+        name: option.name.clone(),
+        kind: permission_option_kind(option.kind),
+      })
+      .collect(),
+  }
+}
+
+fn permission_option_kind(kind: acp::PermissionOptionKind) -> PermissionOptionKind {
+  match kind {
+    acp::PermissionOptionKind::AllowOnce => PermissionOptionKind::AllowOnce,
+    acp::PermissionOptionKind::AllowAlways => PermissionOptionKind::AllowAlways,
+    acp::PermissionOptionKind::RejectOnce => PermissionOptionKind::RejectOnce,
+    acp::PermissionOptionKind::RejectAlways => PermissionOptionKind::RejectAlways,
+    // Never style an unknown kind as an allow button.
+    _ => PermissionOptionKind::RejectOnce,
+  }
+}
+
+fn tool_call_status(status: acp::ToolCallStatus) -> ToolCallStatus {
+  match status {
+    acp::ToolCallStatus::Pending => ToolCallStatus::Pending,
+    acp::ToolCallStatus::InProgress => ToolCallStatus::Running,
+    acp::ToolCallStatus::Completed => ToolCallStatus::Finished,
+    acp::ToolCallStatus::Failed => ToolCallStatus::Failed,
+    _ => ToolCallStatus::Pending,
+  }
+}
+
+fn stop_reason_error(stop_reason: acp::StopReason) -> Option<String> {
+  match stop_reason {
+    acp::StopReason::EndTurn | acp::StopReason::Cancelled => None,
+    acp::StopReason::MaxTokens => Some("The agent reached its token limit".into()),
+    acp::StopReason::MaxTurnRequests => Some("The agent reached its request limit".into()),
+    acp::StopReason::Refusal => Some("The agent refused to continue".into()),
+    other => Some(format!("The agent stopped: {other:?}")),
+  }
+}
+
+fn content_text(content: &acp::ContentBlock) -> String {
+  match content {
+    acp::ContentBlock::Text(text) => text.text.clone(),
+    acp::ContentBlock::Image(_) => "[image]".into(),
+    acp::ContentBlock::Audio(_) => "[audio]".into(),
+    other => format!("[{}]", block_label(other)),
+  }
+}
+
+fn block_label(content: &acp::ContentBlock) -> &'static str {
+  match content {
+    acp::ContentBlock::Text(_) => "text",
+    acp::ContentBlock::Image(_) => "image",
+    acp::ContentBlock::Audio(_) => "audio",
+    _ => "unsupported content",
+  }
+}
+
+fn tool_call_content_text(content: &acp::ToolCallContent) -> String {
+  match content {
+    acp::ToolCallContent::Content(content) => content_text(&content.content),
+    acp::ToolCallContent::Diff(_) => "[diff]".into(),
+    _ => "[unsupported tool content]".into(),
+  }
+}
+
+#[cfg(test)]
+mod tests;

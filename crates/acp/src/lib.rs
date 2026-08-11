@@ -1,0 +1,337 @@
+mod mapping;
+
+use std::{
+  collections::HashMap,
+  path::{Path, PathBuf},
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+  },
+  thread,
+};
+
+use agent_client_protocol::{
+  Agent, Client, ConnectionTo, Responder,
+  schema::{ProtocolVersion, v1 as acp},
+};
+use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures_util::StreamExt;
+use gpui_assistant_core::{
+  AssistantEvent, AssistantEventStream, AssistantRuntime, PermissionOptionId, PermissionRequestId,
+  ThreadId, UserInput,
+};
+
+use crate::mapping::{Turn, permission_request};
+
+pub use agent_client_protocol::{AcpAgent, AcpAgentConfig};
+
+pub struct AcpRuntime {
+  commands: UnboundedSender<Command>,
+  shared: Arc<Shared>,
+}
+
+impl AcpRuntime {
+  /// Spawns the agent process and drives its connection on a dedicated thread.
+  pub fn spawn(agent: AcpAgent, cwd: impl Into<PathBuf>) -> Self {
+    let (commands, receiver) = mpsc::unbounded();
+    let shared = Arc::new(Shared::default());
+    let connection = shared.clone();
+    let cwd = cwd.into();
+
+    thread::spawn(move || {
+      futures_executor::block_on(run(agent, cwd, connection, receiver));
+    });
+
+    Self { commands, shared }
+  }
+
+  pub fn claude_agent(cwd: impl Into<PathBuf>) -> Self {
+    Self::spawn(AcpAgent::claude_agent(), cwd)
+  }
+}
+
+impl AssistantRuntime for AcpRuntime {
+  fn send(&self, input: UserInput) -> AssistantEventStream {
+    let (events, stream) = mpsc::unbounded();
+    let command = Command::Prompt {
+      thread_id: input.thread_id,
+      text: input.text,
+      events: events.clone(),
+    };
+
+    if self.commands.unbounded_send(command).is_err() {
+      let _ = events.unbounded_send(AssistantEvent::Error {
+        message: "The ACP connection is closed".into(),
+      });
+    }
+
+    Box::pin(stream)
+  }
+
+  fn cancel(&self, thread_id: &ThreadId) {
+    let _ = self.commands.unbounded_send(Command::Cancel {
+      thread_id: thread_id.clone(),
+    });
+  }
+
+  fn respond_to_permission(
+    &self,
+    request_id: &PermissionRequestId,
+    option: Option<PermissionOptionId>,
+  ) {
+    self.shared.resolve_permission(request_id, option);
+  }
+}
+
+enum Command {
+  Prompt {
+    thread_id: ThreadId,
+    text: String,
+    events: UnboundedSender<AssistantEvent>,
+  },
+  Cancel {
+    thread_id: ThreadId,
+  },
+}
+
+#[derive(Default)]
+struct Shared {
+  sessions: Mutex<HashMap<ThreadId, String>>,
+  senders: Mutex<HashMap<String, UnboundedSender<AssistantEvent>>>,
+  turns: Mutex<HashMap<String, Turn>>,
+  permissions: Mutex<HashMap<PermissionRequestId, ParkedPermission>>,
+  next_permission: AtomicU64,
+}
+
+struct ParkedPermission {
+  session: String,
+  responder: Responder<acp::RequestPermissionResponse>,
+}
+
+impl Shared {
+  fn session(&self, thread_id: &ThreadId) -> Option<String> {
+    self.sessions.lock().unwrap().get(thread_id).cloned()
+  }
+
+  fn bind_session(&self, thread_id: ThreadId, session: String) {
+    self.sessions.lock().unwrap().insert(thread_id, session);
+  }
+
+  fn register(&self, session: &str, events: UnboundedSender<AssistantEvent>) {
+    self
+      .senders
+      .lock()
+      .unwrap()
+      .insert(session.to_string(), events);
+  }
+
+  /// Dropping the sender ends the stream `send` handed out, which settles the thread.
+  fn unregister(&self, session: &str) {
+    self.senders.lock().unwrap().remove(session);
+  }
+
+  fn emit(&self, session: &str, events: Vec<AssistantEvent>) {
+    let senders = self.senders.lock().unwrap();
+    let Some(sender) = senders.get(session) else {
+      return;
+    };
+
+    for event in events {
+      let _ = sender.unbounded_send(event);
+    }
+  }
+
+  fn dispatch(&self, notification: acp::SessionNotification) {
+    let session = notification.session_id.0.to_string();
+    let events = self.with_turn(&session, |turn| turn.apply(notification.update));
+
+    self.emit(&session, events);
+  }
+
+  fn end_turn(&self, session: &str, stop_reason: acp::StopReason) -> Vec<AssistantEvent> {
+    self.with_turn(session, |turn| turn.end(stop_reason))
+  }
+
+  fn fail_turn(&self, session: &str, message: String) -> Vec<AssistantEvent> {
+    self.with_turn(session, |turn| turn.fail(message))
+  }
+
+  fn with_turn<R>(&self, session: &str, apply: impl FnOnce(&mut Turn) -> R) -> R {
+    let mut turns = self.turns.lock().unwrap();
+    let turn = turns
+      .entry(session.to_string())
+      .or_insert_with(|| Turn::new(session));
+
+    apply(turn)
+  }
+
+  fn park_permission(
+    &self,
+    request: acp::RequestPermissionRequest,
+    responder: Responder<acp::RequestPermissionResponse>,
+  ) {
+    let session = request.session_id.0.to_string();
+    let request_id = PermissionRequestId(format!(
+      "permission-{}",
+      self.next_permission.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    self.permissions.lock().unwrap().insert(
+      request_id.clone(),
+      ParkedPermission {
+        session: session.clone(),
+        responder,
+      },
+    );
+
+    self.emit(
+      &session,
+      vec![AssistantEvent::PermissionRequested {
+        request: permission_request(request_id, &request),
+      }],
+    );
+  }
+
+  fn resolve_permission(
+    &self,
+    request_id: &PermissionRequestId,
+    option: Option<PermissionOptionId>,
+  ) {
+    let Some(parked) = self.permissions.lock().unwrap().remove(request_id) else {
+      return;
+    };
+
+    let outcome = match option {
+      Some(option) => acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+        acp::PermissionOptionId::new(option.0),
+      )),
+      None => acp::RequestPermissionOutcome::Cancelled,
+    };
+
+    let _ = parked
+      .responder
+      .respond(acp::RequestPermissionResponse::new(outcome));
+    self.emit(
+      &parked.session,
+      vec![AssistantEvent::PermissionResolved {
+        request_id: request_id.clone(),
+      }],
+    );
+  }
+}
+
+async fn run(
+  agent: AcpAgent,
+  cwd: PathBuf,
+  shared: Arc<Shared>,
+  mut commands: UnboundedReceiver<Command>,
+) {
+  let notifications = shared.clone();
+  let permissions = shared.clone();
+  let prompts = shared.clone();
+
+  let result = Client
+    .builder()
+    .on_receive_notification(
+      async move |notification: acp::SessionNotification, _connection| {
+        notifications.dispatch(notification);
+        Ok(())
+      },
+      agent_client_protocol::on_receive_notification!(),
+    )
+    .on_receive_request(
+      async move |request: acp::RequestPermissionRequest, responder, _connection| {
+        // Parked instead of awaited: this callback blocks the dispatch loop until it returns.
+        permissions.park_permission(request, responder);
+        Ok(())
+      },
+      agent_client_protocol::on_receive_request!(),
+    )
+    .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
+      connection
+        .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await?;
+
+      while let Some(command) = commands.next().await {
+        match command {
+          Command::Prompt {
+            thread_id,
+            text,
+            events,
+          } => prompt(&connection, &prompts, &cwd, thread_id, text, events).await,
+          Command::Cancel { thread_id } => {
+            if let Some(session) = prompts.session(&thread_id) {
+              let _ = connection
+                .send_notification(acp::CancelNotification::new(acp::SessionId::new(session)));
+            }
+          }
+        }
+      }
+
+      Ok(())
+    })
+    .await;
+
+  if let Err(error) = result {
+    let sessions = shared.senders.lock().unwrap();
+
+    for sender in sessions.values() {
+      let _ = sender.unbounded_send(AssistantEvent::Error {
+        message: format!("The ACP connection failed: {error}"),
+      });
+    }
+  }
+}
+
+async fn prompt(
+  connection: &ConnectionTo<Agent>,
+  shared: &Arc<Shared>,
+  cwd: &Path,
+  thread_id: ThreadId,
+  text: String,
+  events: UnboundedSender<AssistantEvent>,
+) {
+  let session = match shared.session(&thread_id) {
+    Some(session) => session,
+    None => {
+      match connection
+        .send_request(acp::NewSessionRequest::new(cwd.to_path_buf()))
+        .block_task()
+        .await
+      {
+        Ok(response) => {
+          let session = response.session_id.0.to_string();
+          shared.bind_session(thread_id, session.clone());
+
+          session
+        }
+        Err(error) => {
+          let _ = events.unbounded_send(AssistantEvent::Error {
+            message: format!("Failed to open an ACP session: {error}"),
+          });
+
+          return;
+        }
+      }
+    }
+  };
+
+  shared.register(&session, events);
+
+  let response = connection
+    .send_request(acp::PromptRequest::new(
+      acp::SessionId::new(session.clone()),
+      vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+    ))
+    .block_task()
+    .await;
+
+  let events = match response {
+    Ok(response) => shared.end_turn(&session, response.stop_reason),
+    Err(error) => shared.fail_turn(&session, format!("The ACP agent failed: {error}")),
+  };
+
+  shared.emit(&session, events);
+  shared.unregister(&session);
+}

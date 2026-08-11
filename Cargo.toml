@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "crates/acp",
     "crates/core",
     "crates/ui",
     "crates/openai-compatible",
+    "examples/acp-chat",
     "examples/basic-chat",
 ]
 resolver = "2"
@@ -14,7 +16,9 @@ repository = "https://github.com/joris-gallot/gpui-assistant"
 homepage = "https://github.com/joris-gallot/gpui-assistant"
 
 [workspace.dependencies]
+agent-client-protocol = "2"
 anyhow = "1"
+futures-channel = "0.3"
 futures-core = "0.3"
 futures-executor = "0.3"
 futures-util = "0.3"
@@ -23,6 +27,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 # Registry releases pin `gpui` from crates.io, which would not unify with our git gpui.
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+gpui-assistant-acp = { path = "crates/acp" }
 gpui-assistant-core = { path = "crates/core" }
 gpui-assistant-ui = { path = "crates/ui" }
 gpui-assistant-openai-compatible = { path = "crates/openai-compatible" }
