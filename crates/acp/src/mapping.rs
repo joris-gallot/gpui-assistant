@@ -166,6 +166,14 @@ impl Turn {
     message_id
   }
 
+  pub(crate) fn call_name(&self, call_id: &ToolCallId) -> Option<String> {
+    self
+      .calls
+      .get(call_id)
+      .map(|state| state.call.name.clone())
+      .filter(|name| !name.is_empty())
+  }
+
   fn reset(&mut self) {
     self.message_id = None;
     self.calls.clear();
@@ -175,11 +183,13 @@ impl Turn {
 
 pub(crate) fn permission_request(
   id: PermissionRequestId,
+  label: String,
   request: &acp::RequestPermissionRequest,
 ) -> PermissionRequest {
   PermissionRequest {
     id,
-    call_id: ToolCallId(request.tool_call.tool_call_id.0.to_string()),
+    label,
+    call_id: Some(ToolCallId(request.tool_call.tool_call_id.0.to_string())),
     options: request
       .options
       .iter()
@@ -190,6 +200,14 @@ pub(crate) fn permission_request(
       })
       .collect(),
   }
+}
+
+/// What the user reads before allowing a command to run, so it must show the whole thing.
+pub(crate) fn terminal_label(request: &acp::CreateTerminalRequest) -> String {
+  std::iter::once(request.command.clone())
+    .chain(request.args.iter().cloned())
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn permission_option_kind(kind: acp::PermissionOptionKind) -> PermissionOptionKind {

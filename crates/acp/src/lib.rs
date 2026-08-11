@@ -18,12 +18,12 @@ use agent_client_protocol::{
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
 use gpui_assistant_core::{
-  AssistantEvent, AssistantEventStream, AssistantRuntime, PermissionOptionId, PermissionRequestId,
-  ThreadId, UserInput,
+  AssistantEvent, AssistantEventStream, AssistantRuntime, PermissionOption, PermissionOptionId,
+  PermissionOptionKind, PermissionRequest, PermissionRequestId, ThreadId, ToolCallId, UserInput,
 };
 
 use crate::{
-  mapping::{Turn, permission_request},
+  mapping::{Turn, permission_request, terminal_label},
   terminal::Terminals,
 };
 
@@ -38,9 +38,9 @@ impl AcpRuntime {
   /// Spawns the agent process and drives its connection on a dedicated thread.
   pub fn spawn(agent: AcpAgent, cwd: impl Into<PathBuf>) -> Self {
     let (commands, receiver) = mpsc::unbounded();
-    let shared = Arc::new(Shared::default());
-    let connection = shared.clone();
     let cwd = cwd.into();
+    let shared = Arc::new(Shared::new(cwd.clone()));
+    let connection = shared.clone();
 
     thread::spawn(move || {
       futures_executor::block_on(run(agent, cwd, connection, receiver));
@@ -98,22 +98,44 @@ enum Command {
   },
 }
 
-#[derive(Default)]
 struct Shared {
+  cwd: PathBuf,
   sessions: Mutex<HashMap<ThreadId, String>>,
   senders: Mutex<HashMap<String, UnboundedSender<AssistantEvent>>>,
   turns: Mutex<HashMap<String, Turn>>,
-  permissions: Mutex<HashMap<PermissionRequestId, ParkedPermission>>,
+  permissions: Mutex<HashMap<PermissionRequestId, Parked>>,
   next_permission: AtomicU64,
   terminals: Terminals,
 }
 
-struct ParkedPermission {
-  session: String,
-  responder: Responder<acp::RequestPermissionResponse>,
+/// A request from the agent that is waiting on the user.
+enum Parked {
+  Permission {
+    session: String,
+    responder: Responder<acp::RequestPermissionResponse>,
+  },
+  Terminal {
+    session: String,
+    allow: PermissionOptionId,
+    // Boxed to keep the variant from dwarfing the rest of the enum.
+    request: Box<acp::CreateTerminalRequest>,
+    responder: Responder<acp::CreateTerminalResponse>,
+  },
 }
 
 impl Shared {
+  fn new(cwd: PathBuf) -> Self {
+    Self {
+      cwd,
+      sessions: Mutex::default(),
+      senders: Mutex::default(),
+      turns: Mutex::default(),
+      permissions: Mutex::default(),
+      next_permission: AtomicU64::default(),
+      terminals: Terminals::default(),
+    }
+  }
+
   fn session(&self, thread_id: &ThreadId) -> Option<String> {
     self.sessions.lock().unwrap().get(thread_id).cloned()
   }
@@ -178,14 +200,19 @@ impl Shared {
     responder: Responder<acp::RequestPermissionResponse>,
   ) {
     let session = request.session_id.0.to_string();
-    let request_id = PermissionRequestId(format!(
-      "permission-{}",
-      self.next_permission.fetch_add(1, Ordering::Relaxed)
-    ));
+    let request_id = self.next_permission_id();
+    let call_id = ToolCallId(request.tool_call.tool_call_id.0.to_string());
+    let label = request
+      .tool_call
+      .fields
+      .title
+      .clone()
+      .or_else(|| self.with_turn(&session, |turn| turn.call_name(&call_id)))
+      .unwrap_or_else(|| call_id.0.clone());
 
     self.permissions.lock().unwrap().insert(
       request_id.clone(),
-      ParkedPermission {
+      Parked::Permission {
         session: session.clone(),
         responder,
       },
@@ -194,9 +221,61 @@ impl Shared {
     self.emit(
       &session,
       vec![AssistantEvent::PermissionRequested {
-        request: permission_request(request_id, &request),
+        request: permission_request(request_id, label, &request),
       }],
     );
+  }
+
+  /// The agent asked us to run a command. Nothing else gates it, so the user does.
+  fn park_terminal(
+    &self,
+    request: acp::CreateTerminalRequest,
+    responder: Responder<acp::CreateTerminalResponse>,
+  ) {
+    let session = request.session_id.0.to_string();
+    let request_id = self.next_permission_id();
+    let allow = PermissionOptionId(format!("{}-allow", request_id.0));
+    let label = terminal_label(&request);
+
+    self.permissions.lock().unwrap().insert(
+      request_id.clone(),
+      Parked::Terminal {
+        session: session.clone(),
+        allow: allow.clone(),
+        request: Box::new(request),
+        responder,
+      },
+    );
+
+    self.emit(
+      &session,
+      vec![AssistantEvent::PermissionRequested {
+        request: PermissionRequest {
+          id: request_id.clone(),
+          label,
+          call_id: None,
+          options: vec![
+            PermissionOption {
+              id: allow,
+              name: "Run".into(),
+              kind: PermissionOptionKind::AllowOnce,
+            },
+            PermissionOption {
+              id: PermissionOptionId(format!("{}-reject", request_id.0)),
+              name: "Reject".into(),
+              kind: PermissionOptionKind::RejectOnce,
+            },
+          ],
+        },
+      }],
+    );
+  }
+
+  fn next_permission_id(&self) -> PermissionRequestId {
+    PermissionRequestId(format!(
+      "permission-{}",
+      self.next_permission.fetch_add(1, Ordering::Relaxed)
+    ))
   }
 
   fn resolve_permission(
@@ -208,18 +287,40 @@ impl Shared {
       return;
     };
 
-    let outcome = match option {
-      Some(option) => acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-        acp::PermissionOptionId::new(option.0),
-      )),
-      None => acp::RequestPermissionOutcome::Cancelled,
+    let session = match parked {
+      Parked::Permission { session, responder } => {
+        let outcome = match option {
+          Some(option) => acp::RequestPermissionOutcome::Selected(
+            acp::SelectedPermissionOutcome::new(acp::PermissionOptionId::new(option.0)),
+          ),
+          None => acp::RequestPermissionOutcome::Cancelled,
+        };
+
+        let _ = responder.respond(acp::RequestPermissionResponse::new(outcome));
+
+        session
+      }
+      Parked::Terminal {
+        session,
+        allow,
+        request,
+        responder,
+      } => {
+        if option.as_ref() == Some(&allow) {
+          let _ = match self.terminals.create(&request, &self.cwd) {
+            Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
+            Err(error) => responder.respond_with_internal_error(error),
+          };
+        } else {
+          let _ = responder.respond_with_internal_error("The user rejected running this command");
+        }
+
+        session
+      }
     };
 
-    let _ = parked
-      .responder
-      .respond(acp::RequestPermissionResponse::new(outcome));
     self.emit(
-      &parked.session,
+      &session,
       vec![AssistantEvent::PermissionResolved {
         request_id: request_id.clone(),
       }],
@@ -237,7 +338,6 @@ async fn run(
   let permissions = shared.clone();
   let prompts = shared.clone();
   let creates = shared.clone();
-  let create_cwd = cwd.clone();
   let outputs = shared.clone();
   let waits = shared.clone();
   let kills = shared.clone();
@@ -261,12 +361,10 @@ async fn run(
       agent_client_protocol::on_receive_request!(),
     )
     .on_receive_request(
-      async move |request: acp::CreateTerminalRequest, responder, _connection| match creates
-        .terminals
-        .create(&request, &create_cwd)
-      {
-        Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
-        Err(error) => responder.respond_with_internal_error(error),
+      async move |request: acp::CreateTerminalRequest, responder, _connection| {
+        // Parked like a permission: the process only starts once the user allows it.
+        creates.park_terminal(request, responder);
+        Ok(())
       },
       agent_client_protocol::on_receive_request!(),
     )

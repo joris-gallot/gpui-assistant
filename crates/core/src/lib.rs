@@ -266,7 +266,10 @@ pub enum ToolCallStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
   pub id: PermissionRequestId,
-  pub call_id: ToolCallId,
+  /// What the user is being asked to allow, ready to display.
+  pub label: String,
+  /// The tool call this belongs to, when the request came from one.
+  pub call_id: Option<ToolCallId>,
   pub options: Vec<PermissionOption>,
 }
 

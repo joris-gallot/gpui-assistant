@@ -245,7 +245,8 @@ fn apply_event_marks_a_tool_call_failed_when_its_result_is_an_error() {
 fn permission_request(id: &str, call_id: &str) -> PermissionRequest {
   PermissionRequest {
     id: PermissionRequestId(id.into()),
-    call_id: ToolCallId(call_id.into()),
+    label: "cargo test".into(),
+    call_id: Some(ToolCallId(call_id.into())),
     options: vec![
       PermissionOption {
         id: PermissionOptionId("allow".into()),

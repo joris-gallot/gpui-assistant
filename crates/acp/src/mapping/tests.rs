@@ -335,9 +335,14 @@ fn permission_options_keep_their_ids_and_kinds() {
     ],
   );
 
-  let request = permission_request(PermissionRequestId("permission-0".into()), &request);
+  let request = permission_request(
+    PermissionRequestId("permission-0".into()),
+    "read".into(),
+    &request,
+  );
 
-  assert_eq!(request.call_id, ToolCallId("call-1".into()));
+  assert_eq!(request.label, "read");
+  assert_eq!(request.call_id, Some(ToolCallId("call-1".into())));
   assert_eq!(
     request.options,
     vec![
@@ -353,4 +358,12 @@ fn permission_options_keep_their_ids_and_kinds() {
       },
     ]
   );
+}
+
+#[test]
+fn a_terminal_label_shows_the_whole_command() {
+  let mut request = acp::CreateTerminalRequest::new(acp::SessionId::new("session"), "sh");
+  request.args = vec!["-c".into(), "cargo test --workspace".into()];
+
+  assert_eq!(terminal_label(&request), "sh -c cargo test --workspace");
 }

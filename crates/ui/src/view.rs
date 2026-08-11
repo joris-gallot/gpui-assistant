@@ -99,17 +99,7 @@ impl AssistantView {
 
     let rows = requests
       .into_iter()
-      .map(|request| {
-        let tool = self
-          .assistant
-          .read(cx)
-          .thread()
-          .tool_call(&request.call_id)
-          .map(|call| call.name.clone())
-          .unwrap_or_else(|| request.call_id.0.clone());
-
-        self.permission_row(request, tool, colors, cx)
-      })
+      .map(|request| self.permission_row(request, colors, cx))
       .collect::<Vec<_>>();
 
     Some(
@@ -129,7 +119,6 @@ impl AssistantView {
   fn permission_row(
     &self,
     request: PermissionRequest,
-    tool: String,
     colors: &AssistantColors,
     cx: &mut Context<Self>,
   ) -> AnyElement {
@@ -173,7 +162,7 @@ impl AssistantView {
       .flex()
       .flex_col()
       .gap_1()
-      .child(div().text_sm().child(format!("Allow {tool}?")))
+      .child(div().text_sm().child(format!("Allow {}?", request.label)))
       .child(div().flex().gap_2().children(buttons))
       .into_any_element()
   }
