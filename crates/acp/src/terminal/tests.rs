@@ -52,7 +52,7 @@ fn a_spawned_command_reports_its_output_and_exit_code() {
   request.args = vec!["-c".into(), "printf hello; exit 3".into()];
 
   let id = terminals
-    .create(&request, &PathBuf::from("."))
+    .create(&request, &PathBuf::from("."), Box::new(|_, _| {}))
     .expect("sh is available");
   let started = Instant::now();
 

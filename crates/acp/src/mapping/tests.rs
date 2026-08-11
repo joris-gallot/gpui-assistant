@@ -229,7 +229,7 @@ fn terminal_content_resolves_to_the_output_we_captured() {
   request.args = vec!["-c".into(), "printf ran".into()];
 
   let id = terminals
-    .create(&request, &PathBuf::from("."))
+    .create(&request, &PathBuf::from("."), Box::new(|_, _| {}))
     .expect("sh is available");
   let started = Instant::now();
 

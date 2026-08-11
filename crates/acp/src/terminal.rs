@@ -13,6 +13,10 @@ use std::{
 
 use agent_client_protocol::{Responder, schema::v1 as acp};
 
+/// Called with the exit status and the output buffered at that point, so releasing the
+/// terminal cannot race the report.
+pub(crate) type OnExit = Box<dyn FnOnce(acp::TerminalExitStatus, String) + Send>;
+
 const DEFAULT_OUTPUT_BYTE_LIMIT: usize = 64 * 1024;
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -40,6 +44,7 @@ impl Terminals {
     &self,
     request: &acp::CreateTerminalRequest,
     fallback_cwd: &Path,
+    on_exit: OnExit,
   ) -> std::io::Result<String> {
     let byte_limit = request
       .output_byte_limit
@@ -80,7 +85,7 @@ impl Terminals {
 
     let child = Arc::new(Mutex::new(child));
     terminal.lock().unwrap().child = Some(child.clone());
-    spawn_exit_watcher(child, terminal.clone());
+    spawn_exit_watcher(child, terminal.clone(), on_exit);
     self.terminals.lock().unwrap().insert(id.clone(), terminal);
 
     Ok(id)
@@ -197,7 +202,7 @@ fn spawn_reader(mut pipe: impl Read + Send + 'static, terminal: Arc<Mutex<Termin
   });
 }
 
-fn spawn_exit_watcher(child: Arc<Mutex<Child>>, terminal: Arc<Mutex<Terminal>>) {
+fn spawn_exit_watcher(child: Arc<Mutex<Child>>, terminal: Arc<Mutex<Terminal>>, on_exit: OnExit) {
   thread::spawn(move || {
     let status = loop {
       match child.lock().unwrap().try_wait() {
@@ -206,8 +211,15 @@ fn spawn_exit_watcher(child: Arc<Mutex<Child>>, terminal: Arc<Mutex<Terminal>>) 
         Err(_) => break None,
       }
     };
+    let exit = exit_status(status);
+    let output = {
+      let mut terminal = terminal.lock().unwrap();
+      terminal.finish(exit.clone());
 
-    terminal.lock().unwrap().finish(exit_status(status));
+      terminal.output.clone()
+    };
+
+    on_exit(exit, output);
   });
 }
 

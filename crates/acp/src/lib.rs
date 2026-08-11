@@ -19,7 +19,8 @@ use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
 use gpui_assistant_core::{
   AssistantEvent, AssistantEventStream, AssistantRuntime, PermissionOption, PermissionOptionId,
-  PermissionOptionKind, PermissionRequest, PermissionRequestId, ThreadId, ToolCallId, UserInput,
+  PermissionOptionKind, PermissionRequest, PermissionRequestId, ThreadId, ToolCall, ToolCallId,
+  ToolCallStatus, ToolResult, UserInput,
 };
 
 use crate::{
@@ -279,7 +280,7 @@ impl Shared {
 
   /// The agent asked us to run a command. Nothing else gates it, so the user does.
   fn park_terminal(
-    &self,
+    self: &Arc<Self>,
     request: acp::CreateTerminalRequest,
     responder: Responder<acp::CreateTerminalResponse>,
   ) {
@@ -338,14 +339,79 @@ impl Shared {
   }
 
   fn spawn_terminal(
-    &self,
+    self: &Arc<Self>,
     request: &acp::CreateTerminalRequest,
     responder: Responder<acp::CreateTerminalResponse>,
   ) {
-    let _ = match self.terminals.create(request, &self.cwd) {
-      Ok(id) => responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id))),
-      Err(error) => responder.respond_with_internal_error(error),
+    let session = request.session_id.0.to_string();
+    let label = terminal_label(request);
+    let shared = Arc::downgrade(self);
+    let finished_session = session.clone();
+    let on_exit = {
+      let label = label.clone();
+
+      Box::new(move |exit: acp::TerminalExitStatus, output: String| {
+        if let Some(shared) = shared.upgrade() {
+          shared.finish_terminal(&finished_session, &label, &exit, output);
+        }
+      })
     };
+
+    match self.terminals.create(request, &self.cwd, on_exit) {
+      Ok(id) => {
+        // The agent may never embed this terminal in a tool call, so the command becomes
+        // a block of its own instead of running invisibly.
+        self.start_terminal_call(&session, &label);
+        let _ = responder.respond(acp::CreateTerminalResponse::new(acp::TerminalId::new(id)));
+      }
+      Err(error) => {
+        let _ = responder.respond_with_internal_error(error);
+      }
+    }
+  }
+
+  fn start_terminal_call(&self, session: &str, label: &str) {
+    let mut events = Vec::new();
+    let message_id = self.with_turn(session, |turn| turn.open(&mut events));
+
+    events.push(AssistantEvent::ToolCallStarted {
+      message_id,
+      call: ToolCall {
+        id: Self::terminal_call_id(label),
+        name: label.to_string(),
+        input: String::new(),
+        status: ToolCallStatus::Running,
+      },
+    });
+
+    self.emit(session, events);
+  }
+
+  fn finish_terminal(
+    &self,
+    session: &str,
+    label: &str,
+    exit: &acp::TerminalExitStatus,
+    output: String,
+  ) {
+    let mut events = Vec::new();
+    let message_id = self.with_turn(session, |turn| turn.open(&mut events));
+
+    events.push(AssistantEvent::ToolCallFinished {
+      message_id,
+      result: ToolResult {
+        call_id: Self::terminal_call_id(label),
+        output,
+        is_error: exit.exit_code != Some(0),
+      },
+    });
+
+    self.emit(session, events);
+  }
+
+  /// Keyed by command rather than terminal id: the id is minted after the call is shown.
+  fn terminal_call_id(label: &str) -> ToolCallId {
+    ToolCallId(format!("terminal:{label}"))
   }
 
   /// Matched on the whole command line: allowing `cargo test` must not allow anything else.
@@ -376,7 +442,7 @@ impl Shared {
   }
 
   fn resolve_permission(
-    &self,
+    self: &Arc<Self>,
     request_id: &PermissionRequestId,
     option: Option<PermissionOptionId>,
   ) {
@@ -602,7 +668,74 @@ async fn prompt(
 
 #[cfg(test)]
 mod tests {
+  use gpui_assistant_core::{MessagePart, Thread};
+
   use super::*;
+
+  fn drain(events: &mut UnboundedReceiver<AssistantEvent>) -> Thread {
+    let mut thread = Thread::default();
+
+    while let Ok(event) = events.try_recv() {
+      thread.apply_event(event);
+    }
+
+    thread
+  }
+
+  fn exit_status(code: u32) -> acp::TerminalExitStatus {
+    let mut exit = acp::TerminalExitStatus::new();
+    exit.exit_code = Some(code);
+
+    exit
+  }
+
+  #[test]
+  fn a_terminal_shows_up_as_a_tool_call_with_its_output() {
+    let shared = Arc::new(Shared::new(PathBuf::from(".")));
+    let (sender, mut events) = mpsc::unbounded();
+
+    shared.register("session", sender);
+    shared.start_terminal_call("session", "cargo test");
+    shared.finish_terminal("session", "cargo test", &exit_status(0), "49 passed".into());
+
+    let thread = drain(&mut events);
+
+    assert_eq!(thread.messages.len(), 1);
+    assert_eq!(
+      thread.messages[0].parts,
+      vec![
+        MessagePart::ToolCall(ToolCall {
+          id: ToolCallId("terminal:cargo test".into()),
+          name: "cargo test".into(),
+          input: String::new(),
+          status: ToolCallStatus::Finished,
+        }),
+        MessagePart::ToolResult(ToolResult {
+          call_id: ToolCallId("terminal:cargo test".into()),
+          output: "49 passed".into(),
+          is_error: false,
+        }),
+      ]
+    );
+  }
+
+  #[test]
+  fn a_non_zero_exit_marks_the_terminal_call_failed() {
+    let shared = Arc::new(Shared::new(PathBuf::from(".")));
+    let (sender, mut events) = mpsc::unbounded();
+
+    shared.register("session", sender);
+    shared.start_terminal_call("session", "cargo test");
+    shared.finish_terminal("session", "cargo test", &exit_status(101), "failed".into());
+
+    let thread = drain(&mut events);
+    let call_id = ToolCallId("terminal:cargo test".into());
+
+    assert_eq!(
+      thread.tool_call(&call_id).map(|call| call.status),
+      Some(ToolCallStatus::Failed)
+    );
+  }
 
   #[test]
   fn a_session_approval_only_covers_the_exact_command() {

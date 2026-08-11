@@ -151,7 +151,7 @@ impl Turn {
     }]
   }
 
-  fn open(&mut self, events: &mut Vec<AssistantEvent>) -> MessageId {
+  pub(crate) fn open(&mut self, events: &mut Vec<AssistantEvent>) -> MessageId {
     if let Some(message_id) = &self.message_id {
       return message_id.clone();
     }
