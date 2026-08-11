@@ -2,7 +2,7 @@ use gpui::{
   AnyElement, Context, Entity, IntoElement, ListAlignment, ListState, Render, SharedString,
   Subscription, Window, div, list, prelude::*, px,
 };
-use gpui_assistant_core::ThreadStatus;
+use gpui_assistant_core::{PermissionRequest, ThreadStatus};
 
 use crate::{AssistantThread, message::MessageView, style::AssistantColors};
 
@@ -77,10 +77,106 @@ impl AssistantView {
     let (text, color) = match &self.assistant.read(cx).thread().status {
       ThreadStatus::Idle => ("Idle".to_string(), colors.muted_foreground),
       ThreadStatus::Generating => ("Generating".to_string(), colors.muted_foreground),
+      ThreadStatus::WaitingForApproval => {
+        ("Waiting for approval".to_string(), colors.muted_foreground)
+      }
       ThreadStatus::Error { message } => (format!("Error: {message}"), colors.danger),
     };
 
     div().text_sm().text_color(color).child(text)
+  }
+
+  fn permissions_bar(
+    &self,
+    colors: &AssistantColors,
+    cx: &mut Context<Self>,
+  ) -> Option<AnyElement> {
+    let assistant = self.assistant.read(cx);
+    let requests = assistant.thread().pending_permissions.clone();
+
+    if requests.is_empty() {
+      return None;
+    }
+
+    let rows = requests
+      .into_iter()
+      .map(|request| {
+        let tool = self
+          .assistant
+          .read(cx)
+          .thread()
+          .tool_call(&request.call_id)
+          .map(|call| call.name.clone())
+          .unwrap_or_else(|| request.call_id.0.clone());
+
+        self.permission_row(request, tool, colors, cx)
+      })
+      .collect::<Vec<_>>();
+
+    Some(
+      div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded(colors.radius)
+        .border_1()
+        .border_color(colors.border)
+        .children(rows)
+        .into_any_element(),
+    )
+  }
+
+  fn permission_row(
+    &self,
+    request: PermissionRequest,
+    tool: String,
+    colors: &AssistantColors,
+    cx: &mut Context<Self>,
+  ) -> AnyElement {
+    let buttons = request
+      .options
+      .iter()
+      .map(|option| {
+        let request_id = request.id.clone();
+        let option_id = option.id.clone();
+        let (background, foreground) = if option.kind.is_allow() {
+          (colors.foreground, colors.background)
+        } else {
+          (colors.muted, colors.foreground)
+        };
+
+        div()
+          .id(SharedString::from(format!(
+            "{}-{}",
+            request.id.0, option.id.0
+          )))
+          .px_2()
+          .py_1()
+          .rounded(colors.radius)
+          .bg(background)
+          .text_color(foreground)
+          .text_sm()
+          .cursor_pointer()
+          .child(option.name.clone())
+          .on_click(cx.listener(move |this, _, _window, cx| {
+            let request_id = request_id.clone();
+            let option_id = option_id.clone();
+
+            this.assistant.update(cx, |assistant, cx| {
+              assistant.respond_to_permission(&request_id, Some(option_id), cx)
+            });
+          }))
+      })
+      .collect::<Vec<_>>();
+
+    div()
+      .flex()
+      .flex_col()
+      .gap_1()
+      .child(div().text_sm().child(format!("Allow {tool}?")))
+      .child(div().flex().gap_2().children(buttons))
+      .into_any_element()
   }
 
   #[cfg(feature = "gpui-component")]
@@ -183,6 +279,7 @@ impl Render for AssistantView {
         })
         .flex_1(),
       )
+      .children(self.permissions_bar(&colors, cx))
       .child(self.status_bar(&colors, cx))
       .children(self.composer_bar(&colors, cx))
   }

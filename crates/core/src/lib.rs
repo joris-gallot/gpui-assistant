@@ -17,6 +17,7 @@ pub struct Thread {
   pub id: ThreadId,
   pub messages: Vec<Message>,
   pub status: ThreadStatus,
+  pub pending_permissions: Vec<PermissionRequest>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -25,6 +26,7 @@ pub enum ThreadStatus {
   #[default]
   Idle,
   Generating,
+  WaitingForApproval,
   Error {
     message: String,
   },
@@ -74,7 +76,18 @@ impl Thread {
           message.parts.push(MessagePart::ToolResult(result));
         }
       }
-      AssistantEvent::MessageFinished { .. } | AssistantEvent::Error { .. } => {}
+      AssistantEvent::PermissionRequested { request } => self.pending_permissions.push(request),
+      AssistantEvent::PermissionResolved { request_id } => self
+        .pending_permissions
+        .retain(|request| request.id != request_id),
+      // The turn is over, so any responder still parked upstream is moot.
+      AssistantEvent::MessageFinished { .. } | AssistantEvent::Error { .. } => {
+        self.pending_permissions.clear()
+      }
+    }
+
+    if !self.pending_permissions.is_empty() {
+      self.status = ThreadStatus::WaitingForApproval;
     }
   }
 
@@ -86,6 +99,15 @@ impl Thread {
     let message = self.messages.last()?;
 
     (self.is_generating() && message.role == Role::Assistant).then_some(&message.id)
+  }
+
+  pub fn tool_call(&self, call_id: &ToolCallId) -> Option<&ToolCall> {
+    self.messages.iter().rev().find_map(|message| {
+      message.parts.iter().find_map(|part| match part {
+        MessagePart::ToolCall(call) if &call.id == call_id => Some(call),
+        _ => None,
+      })
+    })
   }
 
   fn message_mut(&mut self, message_id: &MessageId) -> Option<&mut Message> {
@@ -226,13 +248,50 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallId(pub String);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
-  PendingApproval,
+  /// Not started: the input is still streaming, or the call awaits approval.
+  #[default]
+  Pending,
   Running,
   Finished,
   Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+  pub id: PermissionRequestId,
+  pub call_id: ToolCallId,
+  pub options: Vec<PermissionOption>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PermissionOption {
+  pub id: PermissionOptionId,
+  pub name: String,
+  pub kind: PermissionOptionKind,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PermissionOptionId(pub String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOptionKind {
+  AllowOnce,
+  AllowAlways,
+  RejectOnce,
+  RejectAlways,
+}
+
+impl PermissionOptionKind {
+  pub fn is_allow(&self) -> bool {
+    matches!(self, Self::AllowOnce | Self::AllowAlways)
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,6 +344,12 @@ pub enum AssistantEvent {
     message_id: MessageId,
     result: ToolResult,
   },
+  PermissionRequested {
+    request: PermissionRequest,
+  },
+  PermissionResolved {
+    request_id: PermissionRequestId,
+  },
   MessageFinished {
     message_id: MessageId,
   },
@@ -296,6 +361,15 @@ pub enum AssistantEvent {
 pub trait AssistantRuntime: Send + Sync + 'static {
   fn send(&self, input: UserInput) -> AssistantEventStream;
   fn cancel(&self, thread_id: &ThreadId);
+
+  /// `option` is `None` when the user dismisses the request instead of choosing.
+  /// Runtimes that never ask for permission can ignore this.
+  fn respond_to_permission(
+    &self,
+    _request_id: &PermissionRequestId,
+    _option: Option<PermissionOptionId>,
+  ) {
+  }
 }
 
 #[derive(Clone, Debug)]

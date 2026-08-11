@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use gpui::{Context, Task};
-use gpui_assistant_core::{AssistantRuntime, Message, Thread, ThreadStatus, UserInput};
+use gpui_assistant_core::{
+  AssistantRuntime, Message, PermissionOptionId, PermissionRequestId, Thread, ThreadStatus,
+  UserInput,
+};
 
 pub struct AssistantThread {
   thread: Thread,
@@ -65,6 +68,18 @@ impl AssistantThread {
     cx.notify();
   }
 
+  /// The runtime answers the agent, then reports back through the event stream, which is
+  /// what clears the request from the thread.
+  pub fn respond_to_permission(
+    &mut self,
+    request_id: &PermissionRequestId,
+    option: Option<PermissionOptionId>,
+    cx: &mut Context<Self>,
+  ) {
+    self.runtime.respond_to_permission(request_id, option);
+    cx.notify();
+  }
+
   pub fn cancel(&mut self, cx: &mut Context<Self>) {
     self.stop_generation();
     self.thread.status = ThreadStatus::Idle;
@@ -88,7 +103,10 @@ impl AssistantThread {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+  };
 
   use gpui::{AppContext, TestAppContext};
   use gpui_assistant_core::{
@@ -97,9 +115,12 @@ mod tests {
 
   use super::*;
 
+  type Responses = Arc<Mutex<Vec<(PermissionRequestId, Option<PermissionOptionId>)>>>;
+
   #[derive(Clone, Default)]
   struct StallingRuntime {
     cancels: Arc<AtomicUsize>,
+    responses: Responses,
   }
 
   impl AssistantRuntime for StallingRuntime {
@@ -109,6 +130,18 @@ mod tests {
 
     fn cancel(&self, _thread_id: &ThreadId) {
       self.cancels.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn respond_to_permission(
+      &self,
+      request_id: &PermissionRequestId,
+      option: Option<PermissionOptionId>,
+    ) {
+      self
+        .responses
+        .lock()
+        .unwrap()
+        .push((request_id.clone(), option));
     }
   }
 
@@ -162,6 +195,29 @@ mod tests {
         }]
       );
     });
+  }
+
+  #[gpui::test]
+  async fn responding_to_a_permission_forwards_the_choice_to_the_runtime(cx: &mut TestAppContext) {
+    let runtime = StallingRuntime::default();
+    let responses = runtime.responses.clone();
+    let assistant = cx.new(|_| AssistantThread::new(thread(), Arc::new(runtime)));
+
+    assistant.update(cx, |assistant, cx| {
+      assistant.respond_to_permission(
+        &PermissionRequestId("permission-0".into()),
+        Some(PermissionOptionId("allow".into())),
+        cx,
+      )
+    });
+
+    assert_eq!(
+      responses.lock().unwrap().as_slice(),
+      [(
+        PermissionRequestId("permission-0".into()),
+        Some(PermissionOptionId("allow".into()))
+      )]
+    );
   }
 
   #[gpui::test]

@@ -213,6 +213,82 @@ fn streaming_message_id_only_targets_trailing_assistant_message() {
   assert_eq!(thread.streaming_message_id(), None);
 }
 
+fn permission_request(id: &str, call_id: &str) -> PermissionRequest {
+  PermissionRequest {
+    id: PermissionRequestId(id.into()),
+    call_id: ToolCallId(call_id.into()),
+    options: vec![
+      PermissionOption {
+        id: PermissionOptionId("allow".into()),
+        name: "Allow".into(),
+        kind: PermissionOptionKind::AllowOnce,
+      },
+      PermissionOption {
+        id: PermissionOptionId("reject".into()),
+        name: "Reject".into(),
+        kind: PermissionOptionKind::RejectOnce,
+      },
+    ],
+  }
+}
+
+#[test]
+fn apply_event_parks_the_thread_until_every_permission_is_resolved() {
+  let mut thread = thread(vec![assistant_message("message-1")]);
+
+  thread.apply_event(AssistantEvent::PermissionRequested {
+    request: permission_request("permission-1", "call-1"),
+  });
+  thread.apply_event(AssistantEvent::PermissionRequested {
+    request: permission_request("permission-2", "call-2"),
+  });
+  assert_eq!(thread.status, ThreadStatus::WaitingForApproval);
+  assert_eq!(thread.pending_permissions.len(), 2);
+
+  thread.apply_event(AssistantEvent::PermissionResolved {
+    request_id: PermissionRequestId("permission-1".into()),
+  });
+  assert_eq!(thread.status, ThreadStatus::WaitingForApproval);
+
+  thread.apply_event(AssistantEvent::PermissionResolved {
+    request_id: PermissionRequestId("permission-2".into()),
+  });
+  assert_eq!(thread.status, ThreadStatus::Generating);
+  assert!(thread.pending_permissions.is_empty());
+}
+
+#[test]
+fn apply_event_drops_pending_permissions_when_the_turn_ends() {
+  let mut thread = thread(vec![assistant_message("message-1")]);
+
+  thread.apply_event(AssistantEvent::PermissionRequested {
+    request: permission_request("permission-1", "call-1"),
+  });
+  thread.apply_event(AssistantEvent::Error {
+    message: "boom".into(),
+  });
+
+  assert!(thread.pending_permissions.is_empty());
+  assert_eq!(
+    thread.status,
+    ThreadStatus::Error {
+      message: "boom".into()
+    }
+  );
+}
+
+#[test]
+fn streaming_message_id_is_none_while_waiting_for_approval() {
+  let mut thread = thread(vec![assistant_message("message-1")]);
+
+  thread.apply_event(AssistantEvent::PermissionRequested {
+    request: permission_request("permission-1", "call-1"),
+  });
+
+  assert!(!thread.is_generating());
+  assert_eq!(thread.streaming_message_id(), None);
+}
+
 #[test]
 fn echo_runtime_streams_response_events() {
   let runtime = EchoRuntime::default();
