@@ -10,7 +10,14 @@ pub(crate) struct Turn {
   session: String,
   index: u64,
   message_id: Option<MessageId>,
-  calls: HashMap<ToolCallId, ToolCall>,
+  calls: HashMap<ToolCallId, CallState>,
+}
+
+/// ACP reports a call's content before it reports completion, so the latest content is
+/// held here until the terminal update turns it into a tool result.
+struct CallState {
+  call: ToolCall,
+  output: String,
 }
 
 impl Turn {
@@ -45,6 +52,7 @@ impl Turn {
       }
       acp::SessionUpdate::ToolCall(call) => {
         let message_id = self.open(&mut events);
+        let output = content_output(&call.content);
         let call = ToolCall {
           id: ToolCallId(call.tool_call_id.0.to_string()),
           name: call.title,
@@ -55,58 +63,56 @@ impl Turn {
           status: tool_call_status(call.status),
         };
 
-        self.calls.insert(call.id.clone(), call.clone());
+        self.calls.insert(
+          call.id.clone(),
+          CallState {
+            call: call.clone(),
+            output,
+          },
+        );
         events.push(AssistantEvent::ToolCallStarted { message_id, call });
       }
       acp::SessionUpdate::ToolCallUpdate(update) => {
         let message_id = self.open(&mut events);
         let call_id = ToolCallId(update.tool_call_id.0.to_string());
         // ACP sends partial updates, so merge onto the snapshot we already hold.
-        let call = self.calls.entry(call_id.clone()).or_insert(ToolCall {
-          id: call_id.clone(),
-          name: String::new(),
-          input: String::new(),
-          status: ToolCallStatus::Pending,
+        let state = self.calls.entry(call_id.clone()).or_insert(CallState {
+          call: ToolCall {
+            id: call_id.clone(),
+            name: String::new(),
+            input: String::new(),
+            status: ToolCallStatus::Pending,
+          },
+          output: String::new(),
         });
 
         if let Some(title) = update.fields.title {
-          call.name = title;
+          state.call.name = title;
         }
         if let Some(status) = update.fields.status {
-          call.status = tool_call_status(status);
+          state.call.status = tool_call_status(status);
+        }
+        if let Some(content) = update.fields.content {
+          state.output = content_output(&content);
         }
 
-        let output = update.fields.content.map(|content| {
-          content
-            .iter()
-            .map(tool_call_content_text)
-            .collect::<Vec<_>>()
-            .join("\n")
+        events.push(AssistantEvent::ToolCallUpdated {
+          message_id: message_id.clone(),
+          call: state.call.clone(),
         });
 
-        match call.status {
-          ToolCallStatus::Finished | ToolCallStatus::Failed => {
-            let is_error = call.status == ToolCallStatus::Failed;
-
-            events.push(AssistantEvent::ToolCallUpdated {
-              message_id: message_id.clone(),
-              call: call.clone(),
-            });
-            events.push(AssistantEvent::ToolCallFinished {
-              message_id,
-              result: ToolResult {
-                call_id,
-                output: output.unwrap_or_default(),
-                is_error,
-              },
-            });
-          }
-          ToolCallStatus::Pending | ToolCallStatus::Running => {
-            events.push(AssistantEvent::ToolCallUpdated {
-              message_id,
-              call: call.clone(),
-            });
-          }
+        if matches!(
+          state.call.status,
+          ToolCallStatus::Finished | ToolCallStatus::Failed
+        ) {
+          events.push(AssistantEvent::ToolCallFinished {
+            message_id,
+            result: ToolResult {
+              call_id,
+              output: state.output.clone(),
+              is_error: state.call.status == ToolCallStatus::Failed,
+            },
+          });
         }
       }
       // Nothing to show yet for plans, modes, commands or config, and the enum is
@@ -229,10 +235,20 @@ fn block_label(content: &acp::ContentBlock) -> &'static str {
   }
 }
 
+fn content_output(content: &[acp::ToolCallContent]) -> String {
+  content
+    .iter()
+    .map(tool_call_content_text)
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
 fn tool_call_content_text(content: &acp::ToolCallContent) -> String {
   match content {
     acp::ToolCallContent::Content(content) => content_text(&content.content),
-    acp::ToolCallContent::Diff(_) => "[diff]".into(),
+    acp::ToolCallContent::Diff(diff) => {
+      format!("{}\n{}", diff.path.display(), diff.new_text)
+    }
     _ => "[unsupported tool content]".into(),
   }
 }

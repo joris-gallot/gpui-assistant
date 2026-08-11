@@ -153,6 +153,69 @@ fn a_completed_update_also_emits_the_tool_result() {
 }
 
 #[test]
+fn content_reported_before_completion_survives_into_the_result() {
+  let mut turn = Turn::new("session");
+
+  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+    "call-1", "read",
+  )));
+  turn.apply(acp::SessionUpdate::ToolCallUpdate(
+    acp::ToolCallUpdate::new(
+      acp::ToolCallId::new("call-1"),
+      acp::ToolCallUpdateFields::new()
+        .status(acp::ToolCallStatus::InProgress)
+        .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+          acp::TextContent::new("file contents"),
+        ))]),
+    ),
+  ));
+
+  // The terminal update carries no content: ACP already reported it.
+  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(tool_call_update(
+    "call-1",
+    acp::ToolCallStatus::Completed,
+  )));
+
+  assert_eq!(
+    events.last(),
+    Some(&AssistantEvent::ToolCallFinished {
+      message_id: MessageId("session-assistant-0".into()),
+      result: ToolResult {
+        call_id: ToolCallId("call-1".into()),
+        output: "file contents".into(),
+        is_error: false,
+      },
+    })
+  );
+}
+
+#[test]
+fn a_diff_keeps_its_path_and_new_text() {
+  let mut turn = Turn::new("session");
+
+  turn.apply(acp::SessionUpdate::ToolCall(acp_tool_call(
+    "call-1", "edit",
+  )));
+  let events = turn.apply(acp::SessionUpdate::ToolCallUpdate(
+    acp::ToolCallUpdate::new(
+      acp::ToolCallId::new("call-1"),
+      acp::ToolCallUpdateFields::new()
+        .status(acp::ToolCallStatus::Completed)
+        .content(vec![acp::ToolCallContent::from(acp::Diff::new(
+          "/tmp/acp-test.txt",
+          "hello",
+        ))]),
+    ),
+  ));
+
+  assert!(matches!(
+    events.last(),
+    Some(AssistantEvent::ToolCallFinished { result, .. })
+      if result.output == "/tmp/acp-test.txt\nhello"
+  ));
+}
+
+#[test]
 fn a_failed_update_marks_the_result_as_an_error() {
   let mut turn = Turn::new("session");
 
