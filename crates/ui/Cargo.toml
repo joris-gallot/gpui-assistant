@@ -6,10 +6,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["gpui-component"]
+gpui-component = ["dep:gpui-component"]
+
 [dependencies]
 futures-util.workspace = true
 gpui.workspace = true
 gpui-assistant-core.workspace = true
+gpui-component = { workspace = true, optional = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

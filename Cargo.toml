@@ -20,6 +20,9 @@ futures-executor = "0.3"
 futures-util = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+# Registry releases pin `gpui` from crates.io, which would not unify with our git gpui.
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 gpui-assistant-core = { path = "crates/core" }
 gpui-assistant-ui = { path = "crates/ui" }
 gpui-assistant-openai-compatible = { path = "crates/openai-compatible" }

@@ -1,5 +1,8 @@
+mod message;
+mod style;
 mod thread;
-mod views;
+mod view;
 
+pub use message::MessageView;
 pub use thread::AssistantThread;
-pub use views::{AssistantView, MessageView, ThreadView};
+pub use view::AssistantView;
