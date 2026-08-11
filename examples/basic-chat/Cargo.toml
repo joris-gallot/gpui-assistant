@@ -9,3 +9,5 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui-assistant-core.workspace = true
 gpui-assistant-ui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
