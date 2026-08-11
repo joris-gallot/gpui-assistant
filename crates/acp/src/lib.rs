@@ -123,6 +123,14 @@ enum Parked {
   },
 }
 
+impl Parked {
+  fn session(&self) -> &str {
+    match self {
+      Parked::Permission { session, .. } | Parked::Terminal { session, .. } => session,
+    }
+  }
+}
+
 impl Shared {
   fn new(cwd: PathBuf) -> Self {
     Self {
@@ -178,11 +186,49 @@ impl Shared {
   }
 
   fn end_turn(&self, session: &str, stop_reason: acp::StopReason) -> Vec<AssistantEvent> {
-    self.with_turn(session, |turn| turn.end(stop_reason))
+    let mut events = self.cancel_parked(session);
+    events.extend(self.with_turn(session, |turn| turn.end(stop_reason)));
+
+    events
   }
 
   fn fail_turn(&self, session: &str, message: String) -> Vec<AssistantEvent> {
-    self.with_turn(session, |turn| turn.fail(message))
+    let mut events = self.cancel_parked(session);
+    events.extend(self.with_turn(session, |turn| turn.fail(message)));
+
+    events
+  }
+
+  /// Nobody can answer a request once its turn is over, and an unanswered responder keeps
+  /// the agent waiting, so the end of a turn cancels whatever is still parked.
+  fn cancel_parked(&self, session: &str) -> Vec<AssistantEvent> {
+    let mut permissions = self.permissions.lock().unwrap();
+    let parked = permissions
+      .iter()
+      .filter(|(_, parked)| parked.session() == session)
+      .map(|(request_id, _)| request_id.clone())
+      .collect::<Vec<_>>();
+
+    parked
+      .into_iter()
+      .filter_map(|request_id| {
+        let parked = permissions.remove(&request_id)?;
+
+        match parked {
+          Parked::Permission { responder, .. } => {
+            let _ = responder.respond(acp::RequestPermissionResponse::new(
+              acp::RequestPermissionOutcome::Cancelled,
+            ));
+          }
+          Parked::Terminal { responder, .. } => {
+            let _ =
+              responder.respond_with_internal_error("The turn ended before the user answered");
+          }
+        }
+
+        Some(AssistantEvent::PermissionResolved { request_id })
+      })
+      .collect()
   }
 
   fn with_turn<R>(&self, session: &str, apply: impl FnOnce(&mut Turn) -> R) -> R {
