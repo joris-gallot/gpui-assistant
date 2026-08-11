@@ -1,22 +1,51 @@
+use std::sync::Arc;
+
 use gpui::{
-  App, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowOptions, div, prelude::*,
-  px, rgb, size,
+  App, Bounds, Context, Entity, IntoElement, Render, Window, WindowBounds, WindowOptions, div,
+  prelude::*, px, rgb, size,
 };
-use gpui_assistant_core::{Message, Thread, ThreadId};
-use gpui_assistant_ui::AssistantView;
+use gpui_assistant_core::{EchoRuntime, Thread, ThreadId, ThreadStatus};
+use gpui_assistant_ui::{AssistantThread, AssistantView};
 use gpui_platform::application;
 
 struct BasicChat {
-  thread: Thread,
+  assistant: Entity<AssistantThread>,
 }
 
 impl Render for BasicChat {
-  fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let thread = self.assistant.read(cx).thread().clone();
+    let status = match &thread.status {
+      ThreadStatus::Idle => "Idle".to_string(),
+      ThreadStatus::Generating => "Generating".to_string(),
+      ThreadStatus::Error { message } => format!("Error: {message}"),
+    };
+
     div()
+      .flex()
+      .flex_col()
+      .gap_3()
       .size_full()
       .p_4()
       .bg(rgb(0xffffff))
-      .child(AssistantView::new(self.thread.clone()))
+      .child(div().flex_1().child(AssistantView::new(thread)))
+      .child(div().text_sm().text_color(rgb(0x6b7280)).child(status))
+      .child(
+        div()
+          .id("send")
+          .px_3()
+          .py_2()
+          .rounded_md()
+          .bg(rgb(0x111827))
+          .text_color(rgb(0xffffff))
+          .cursor_pointer()
+          .child("Send ping")
+          .on_click(cx.listener(|this, _, _window, cx| {
+            this
+              .assistant
+              .update(cx, |assistant, cx| assistant.send("ping", cx));
+          })),
+      )
   }
 }
 
@@ -30,14 +59,17 @@ fn main() {
         ..Default::default()
       },
       |_, cx| {
-        cx.new(|_| BasicChat {
-          thread: Thread {
+        cx.new(|cx| {
+          let thread = Thread {
             id: ThreadId("example".into()),
-            messages: vec![
-              Message::user("user-1", "Hello GPUI assistant"),
-              Message::assistant("assistant-1", "Hello. This is the initial scaffold."),
-            ],
-          },
+            ..Default::default()
+          };
+          let assistant =
+            cx.new(|_| AssistantThread::new(thread, Arc::new(EchoRuntime::default())));
+
+          cx.observe(&assistant, |_, _, cx| cx.notify()).detach();
+
+          BasicChat { assistant }
         })
       },
     )
