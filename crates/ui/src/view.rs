@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use gpui::{
   AnyElement, Context, Entity, IntoElement, ListAlignment, ListState, Render, SharedString,
   Subscription, Window, div, list, prelude::*, px,
@@ -63,12 +65,9 @@ impl AssistantView {
 
   fn sync_messages(&mut self, assistant: Entity<AssistantThread>, cx: &mut Context<Self>) {
     let count = assistant.read(cx).thread().messages.len();
-    // Deltas only ever mutate the trailing message, so re-splice it to drop its stale measurement.
-    let changed_from = self.message_count.min(count.saturating_sub(1));
+    let (range, spliced) = spliced_range(self.message_count, count);
 
-    self
-      .list
-      .splice(changed_from..self.message_count, count - changed_from);
+    self.list.splice(range, spliced);
     self.message_count = count;
     cx.notify();
   }
@@ -249,6 +248,16 @@ impl AssistantView {
   }
 }
 
+/// The range to hand `ListState::splice`, given the previous and current message counts.
+///
+/// Streaming only mutates the trailing message, so that message is always re-spliced:
+/// `ListState` caches measured heights and would otherwise keep the stale one.
+fn spliced_range(previous: usize, current: usize) -> (Range<usize>, usize) {
+  let start = previous.min(current.saturating_sub(1));
+
+  (start..previous, current - start)
+}
+
 impl Render for AssistantView {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let colors = AssistantColors::new(cx);
@@ -285,6 +294,37 @@ impl Render for AssistantView {
   }
 }
 
+#[cfg(test)]
+mod splice_tests {
+  use super::spliced_range;
+
+  #[test]
+  fn the_first_message_is_inserted() {
+    assert_eq!(spliced_range(0, 1), (0..0, 1));
+  }
+
+  #[test]
+  fn an_appended_message_does_not_touch_the_earlier_ones() {
+    assert_eq!(spliced_range(1, 2), (1..1, 1));
+  }
+
+  #[test]
+  fn a_delta_re_splices_the_trailing_message() {
+    // Skipping this leaves ListState holding the height measured before the delta.
+    assert_eq!(spliced_range(2, 2), (1..2, 1));
+  }
+
+  #[test]
+  fn a_shorter_thread_replaces_the_whole_list() {
+    assert_eq!(spliced_range(3, 1), (0..3, 1));
+  }
+
+  #[test]
+  fn an_emptied_thread_clears_the_list() {
+    assert_eq!(spliced_range(2, 0), (0..2, 0));
+  }
+}
+
 #[cfg(all(test, feature = "gpui-component"))]
 mod tests {
   use std::sync::Arc;
@@ -314,6 +354,37 @@ mod tests {
     let view = window.root(cx).unwrap();
 
     (view, VisualTestContext::from_window(window.into(), cx))
+  }
+
+  // The splice arithmetic in sync_messages is hand-rolled: a wrong range silently stops
+  // re-measuring a streaming message, or drifts the list out of sync with the thread.
+  #[gpui::test]
+  async fn the_list_stays_in_sync_across_appends_and_deltas(cx: &mut TestAppContext) {
+    let (view, mut cx) = setup(cx);
+
+    view.read_with(&cx, |view, _| assert_eq!(view.list.item_count(), 0));
+
+    view.update(&mut cx, |view, cx| {
+      view
+        .assistant
+        .update(cx, |assistant, cx| assistant.send("first", cx))
+    });
+    cx.run_until_parked();
+    view.read_with(&cx, |view, _| assert_eq!(view.list.item_count(), 2));
+
+    view.update(&mut cx, |view, cx| {
+      view
+        .assistant
+        .update(cx, |assistant, cx| assistant.send("second", cx))
+    });
+    cx.run_until_parked();
+    view.read_with(&cx, |view, cx| {
+      assert_eq!(view.list.item_count(), 4);
+      assert_eq!(
+        view.list.item_count(),
+        view.assistant.read(cx).thread().messages.len()
+      );
+    });
   }
 
   #[gpui::test]

@@ -145,6 +145,16 @@ mod tests {
     }
   }
 
+  struct SilentRuntime;
+
+  impl AssistantRuntime for SilentRuntime {
+    fn send(&self, _input: UserInput) -> AssistantEventStream {
+      Box::pin(futures_util::stream::empty())
+    }
+
+    fn cancel(&self, _thread_id: &ThreadId) {}
+  }
+
   fn thread() -> Thread {
     Thread {
       id: ThreadId("thread".into()),
@@ -194,6 +204,41 @@ mod tests {
           text: "Echo: second".into()
         }]
       );
+    });
+  }
+
+  #[gpui::test]
+  async fn a_stream_that_ends_without_finishing_still_settles(cx: &mut TestAppContext) {
+    let assistant = cx.new(|_| AssistantThread::new(thread(), Arc::new(SilentRuntime)));
+
+    assistant.update(cx, |assistant, cx| assistant.send("Hello", cx));
+    cx.run_until_parked();
+
+    assistant.read_with(cx, |assistant, _| {
+      let thread = assistant.thread();
+
+      assert_eq!(thread.status, ThreadStatus::Idle);
+      assert_eq!(thread.messages.len(), 1);
+    });
+  }
+
+  #[gpui::test]
+  async fn a_new_turn_cancels_the_one_still_running(cx: &mut TestAppContext) {
+    let runtime = StallingRuntime::default();
+    let cancels = runtime.cancels.clone();
+    let assistant = cx.new(|_| AssistantThread::new(thread(), Arc::new(runtime)));
+
+    assistant.update(cx, |assistant, cx| assistant.send("first", cx));
+    cx.run_until_parked();
+    assistant.update(cx, |assistant, cx| assistant.send("second", cx));
+    cx.run_until_parked();
+
+    assert_eq!(cancels.load(Ordering::Relaxed), 1);
+    assistant.read_with(cx, |assistant, _| {
+      let thread = assistant.thread();
+
+      assert!(thread.is_generating());
+      assert_eq!(thread.messages.len(), 2);
     });
   }
 
